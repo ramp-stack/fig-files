@@ -1,0 +1,92 @@
+[package]
+name = "fig-files"
+version = "0.1.0"
+edition = "2024"
+default-run = "fig-files"
+description = "Native AIR-backed file manager built with CHK, with shared read/write access to files and folders."
+repository = "https://github.com/ramp-stack/fig-files"
+
+[dependencies]
+ramp = {package = "ramp2", version = "3.0.3"}
+chk = {path = "../chk"}
+
+include_dir = "0.7.4"
+serde = {version = "1", features = ["derive"]}
+prism = {package = "prism2", version = "3.1.0"}
+resvg = {version = "0.47.0", default-features = false, features = ["text", "system-fonts", "raster-images"]}
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2-core-graphics = {version = "0.3.2", default-features = false, features = ["std", "CGAffineTransform", "CGGeometry", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage", "CGPDFDocument", "CGPDFPage"]}
+objc2-core-foundation = {version = "0.3.2", default-features = false, features = ["std", "CFData", "CFCGTypes"]}
+
+[lib]
+name="main"
+crate-type=["staticlib", "cdylib", "rlib"]
+
+[dev-dependencies]
+air = "4.0.1"
+postcard = {version = "1.1", features = ["alloc"]}
+media = {package = "media2", version = "0.1.1"}
+futures = "0.3.34"
+
+[profile.dev.package.swash]
+opt-level = 3
+[profile.dev.package.skrifa]
+opt-level = 3
+[profile.dev.package.read-fonts]
+opt-level = 3
+[profile.dev.package.zeno]
+opt-level = 3
+[profile.dev.package.yazi]
+opt-level = 3
+[profile.dev.package.fontdue]
+opt-level = 3
+[profile.dev.package.ttf-parser]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.gif]
+opt-level = 3
+[profile.dev.package.weezl]
+opt-level = 3
+
+[package.metadata.piston.ios]
+team = "RYYG6X8WK7"
+bundle_id = "org.ramp.figfiles"
+minimum_os = "17.0"
+info_plist = "ios/Info.plist"
+resources = ["ios/FigFilesLaunchScreen.storyboard", "ios/FigFilesLaunchIcon.png"]
+build_number = "6"
+
+[package.metadata.piston.macos]
+team = "RYYG6X8WK7"
+bundle_id = "org.ramp.fig-files"
+
+[package.metadata.piston.developer]
+team = "RYYG6X8WK7"
+identity = "023c8a09189d12e0755e224a9e8a6af15b21186758aef12e65b0231757dd3bdee0"
+
+[package.metadata.piston.notifications]
+enabled = true
+
+[package.metadata.piston.notifications.ios.development]
+team = "RYYG6X8WK7"
+topic = "org.ramp.fig-files"
+identity = "023c8a09189d12e0755e224a9e8a6af15b21186758aef12e65b0231757dd3bdee0"
+application = "e4cb0c447e8ea1318948162355cb3bcf1182354421ec0749eb547a2726b4d38a"
+
+[package.metadata.piston.notifications.ios.production]
+team = "RYYG6X8WK7"
+topic = "org.ramp.figfiles"
+identity = "023c8a09189d12e0755e224a9e8a6af15b21186758aef12e65b0231757dd3bdee0"
+application = "e94d20d0117656cc0a823abc0a355e61e1d0a78b956f754c7d94ac7376146125"
+
+[package.metadata.piston.testflight]
+app_id = "6827364951"
+version = "0.1.0"
+build_number = "6"
+state = "complete"

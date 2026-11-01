@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"><circle cx="128" cy="128" r="120" fill="#24113E"/><circle cx="128" cy="128" r="116" fill="none" stroke="#422267" stroke-width="2"/><path d="M49 86a15 15 0 0 1 15-15h40l18 17h70a15 15 0 0 1 15 15v79a17 17 0 0 1-17 17H66a17 17 0 0 1-17-17Z" fill="#5B21B6"/>
+<path d="M132 75h35l19 20v62h-54Z" fill="#F9F7FF"/><path d="M167 75v20h19" fill="#C7A0FF"/>
+<path d="M46 112a14 14 0 0 1 14-14h137a14 14 0 0 1 14 16l-8 68a18 18 0 0 1-18 16H73a19 19 0 0 1-19-16Z" fill="#8B35FF"/>
+<path d="M59 112h135" stroke="#FF64BC" stroke-width="7" stroke-linecap="round"/>
+<path d="M69 121v47" stroke="#CDA8FF" stroke-width="5" stroke-linecap="round"/>
+<path d="M89 96c-22-2-27-15-19-23 5 0 10 4 13 8-5-16 0-25 8-27 7 5 10 12 10 19 5-15 14-21 25-17 0 17-12 31-26 40Z" fill="#A6F347"/>
+<path d="m90 97 25-30" stroke="#D7FF62" stroke-width="5" stroke-linecap="round"/>
+<path d="M144 129c6-3 9 1 5 8-7 13 8 30-5 44-12 13-34 8-38-7-6-16 10-29 28-33 7-2 7-9 10-12Z" fill="#E7C8FF"/>
+<path d="M141 142c4-2 5 0 3 5-4 9 6 21-4 30-8 8-23 6-26-5-3-12 9-20 20-23 4-1 5-5 7-7Z" fill="#FF64BC"/>
+<ellipse cx="126" cy="159" rx="3" ry="5" transform="rotate(-25 126 159)" fill="#FFF8E7"/><ellipse cx="139" cy="161" rx="3" ry="5" transform="rotate(25 139 161)" fill="#FFF8E7"/></svg>
