@@ -226,6 +226,91 @@ fn item_count(count: usize) -> String {
     )
 }
 
+/// Snapshot the roster when opening Orange's CHK search form. Watching updates
+/// here would rebuild the form and discard its selected contacts.
+pub(crate) fn search_items(ctx: &Context) -> Vec<(ListItem, Name)> {
+    let books = ctx
+        .air
+        .instances::<AddressBook>()
+        .list()
+        .into_values()
+        .collect::<Vec<_>>();
+    let spaces = ctx
+        .air
+        .instances::<SharedSpace>()
+        .list()
+        .into_values()
+        .collect::<Vec<_>>();
+    let transfers = ctx
+        .air
+        .instances::<Transfer>()
+        .list()
+        .into_values()
+        .collect::<Vec<_>>();
+    roster(ctx.air.me(), &books, &spaces, &transfers)
+        .into_iter()
+        .map(|contact| {
+            (
+                ListItem::avatar(
+                    AvatarContent::icon(Icons::Profile, AvatarIconStyle::Brand),
+                    &short_name(contact.name),
+                    &contact.name.to_string(),
+                    None,
+                    None,
+                ),
+                contact.name,
+            )
+        })
+        .collect()
+}
+
+/// Match Orange's nested New contact form: save, return to the existing search
+/// page, and select the new name without losing contacts already selected.
+pub(crate) fn new_contact(theme: &Theme) -> Form {
+    Form::flow(
+        theme,
+        vec![FormItem::text(
+            "New contact",
+            "Fig Files receiving name",
+            Some(vec![
+                FormAction::Paste,
+                FormAction::scan_qr_code("Scan a Fig Files receiving name"),
+            ]),
+            |ctx: &mut Context, text: String| {
+                if text.is_empty() {
+                    FormValidState::Invalid
+                } else {
+                    match contacts::parse(&text, ctx.air.me()) {
+                        Ok(_) => FormValidState::Valid,
+                        Err(error) => FormValidState::InvalidWithData(error.to_string()),
+                    }
+                }
+            },
+        )],
+        None,
+        None,
+        Box::new(|ctx: &mut Context, states: &Vec<State>| {
+            let Some(State::Text(text)) = states.first() else {
+                return FormComplete::None;
+            };
+            let Ok(name) = contacts::parse(text, ctx.air.me()) else {
+                return FormComplete::None;
+            };
+            match contacts::add(&ctx.air, name) {
+                Ok(name) => {
+                    FormComplete::Return(Box::new(move |ctx: &mut Context, theme: &Theme| {
+                        (Action::choose_search(name).get())(ctx, theme)
+                    }))
+                }
+                Err(error) => FormComplete::Next(browser::message(
+                    "Could not add contact",
+                    &error.to_string(),
+                )),
+            }
+        }),
+    )
+}
+
 pub(crate) fn home() -> Page {
     Page::watching(
         (

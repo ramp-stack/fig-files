@@ -8,6 +8,7 @@ pub mod contacts;
 mod contacts_ui;
 pub mod drafts;
 mod pdf_preview;
+mod preview;
 mod runtime;
 pub mod sharing;
 mod sharing_ui;

@@ -195,7 +195,7 @@ mod tests {
         let mut book = catalog.create::<AddressBook>(()).unwrap();
         book.send(ContactAction::Add(peer.name())).unwrap();
         book.send(ContactAction::Add(another.name())).unwrap();
-        let first_added = book.pending().unwrap().contacts[&peer.name()];
+        let provisional_first_added = book.pending().unwrap().contacts[&peer.name()];
         book.send(ContactAction::Add(peer.name())).unwrap();
         // Include an in-flight encrypted request in the restart fixture.
         let _ = book.start();
@@ -204,13 +204,26 @@ mod tests {
         let mut catalog: air::Air =
             postcard::from_bytes(&postcard::to_allocvec(&catalog).unwrap()).unwrap();
         assert_eq!(book.pending().unwrap().contacts.len(), 2);
-        assert_eq!(book.pending().unwrap().contacts[&peer.name()], first_added);
+        assert_eq!(
+            book.pending().unwrap().contacts[&peer.name()],
+            provisional_first_added
+        );
         assert!(catalog.list(&AddressBook::id()).contains(book.location()));
 
         let mut server = TestServer::new();
         server.sync_catalog(&mut catalog);
         server.sync(&mut book);
         assert_eq!(book.confirmed().unwrap().owner, owner.name());
+        assert_eq!(book.confirmed().unwrap().contacts.len(), 2);
+        // AIR's confirmed metadata replaces the provisional client timestamp.
+        // Once confirmed, repeats and cold replay must preserve that first time.
+        let confirmed_first_added = book.confirmed().unwrap().contacts[&peer.name()];
+        book.send(ContactAction::Add(peer.name())).unwrap();
+        server.sync(&mut book);
+        assert_eq!(
+            book.confirmed().unwrap().contacts[&peer.name()],
+            confirmed_first_added
+        );
         let mut restored =
             air::Instance::<AddressBook>::receive(owner.clone(), *book.location()).unwrap();
         assert!(restored.pending().is_none());
@@ -218,7 +231,7 @@ mod tests {
         assert_eq!(restored.confirmed(), book.confirmed());
         assert_eq!(
             restored.confirmed().unwrap().contacts[&peer.name()],
-            first_added
+            confirmed_first_added
         );
 
         // Saving names creates no inbox invitations for either contact.

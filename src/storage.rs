@@ -327,7 +327,9 @@ impl Contract for Vault {
                 space,
                 expected,
             } => {
-                if self.subtree_fingerprint(id)? != expected {
+                if self.subtree_fingerprint(id)? != expected
+                    && self.legacy_subtree_fingerprint(id)? != expected
+                {
                     return Err(StorageError::Changed);
                 }
                 let folder = self.active(id)?.is_folder();
@@ -410,13 +412,38 @@ impl Contract for Vault {
 
 impl Vault {
     pub fn subtree_fingerprint(&self, id: EntryId) -> Result<Id, StorageError> {
-        self.active(id)?;
         let entries: Vec<_> = self
+            .subtree_entries(id)?
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.parent,
+                    &entry.name,
+                    &entry.kind,
+                    entry.favorite,
+                    entry.trashed_at.is_some(),
+                )
+            })
+            .collect();
+        // AIR replaces speculative timestamps during confirmation and replay.
+        // Only content, hierarchy, and explicit Trash state guard promotion.
+        Ok(Id::hash(&("org.ramp.fig-files.subtree.v2", entries)))
+    }
+
+    fn legacy_subtree_fingerprint(&self, id: EntryId) -> Result<Id, StorageError> {
+        // Preserve replay of PromoteShared messages written before timestamps
+        // were excluded from the fingerprint. New messages use the stable form.
+        Ok(Id::hash(&self.subtree_entries(id)?))
+    }
+
+    fn subtree_entries(&self, id: EntryId) -> Result<Vec<&Entry>, StorageError> {
+        self.active(id)?;
+        Ok(self
             .entries
             .values()
             .filter(|entry| entry.id == id || self.is_descendant(entry.id, id))
-            .collect();
-        Ok(Id::hash(&entries))
+            .collect())
     }
     fn available_root_name(&self, name: &str, folder: bool) -> Result<String, StorageError> {
         match self.validate_destination(None, name, None) {
@@ -985,6 +1012,143 @@ pub(crate) mod tests {
             Ok(id)
         );
         id
+    }
+
+    fn promotion_fixture(timestamp: u64, confirmed: bool) -> (Vault, EntryId, EntryId, EntryId) {
+        let at = || Metadata {
+            timestamp,
+            confirmed,
+            ..metadata()
+        };
+        let mut vault = Vault::init((), at());
+        let root = Id::from(100);
+        let file = Id::from(101);
+        let trashed = Id::from(102);
+        for (id, parent, name, kind) in [
+            (root, None, "Project", EntryKind::Folder),
+            (
+                file,
+                Some(root),
+                "notes.txt",
+                EntryKind::File {
+                    blob: Id::from(103),
+                    size: 8,
+                    mime: "text/plain".into(),
+                },
+            ),
+            (trashed, Some(root), "Old drafts", EntryKind::Folder),
+        ] {
+            vault
+                .apply(
+                    VaultAction::Create {
+                        id,
+                        parent,
+                        name: name.into(),
+                        kind,
+                    },
+                    at(),
+                )
+                .unwrap();
+        }
+        vault.apply(VaultAction::Trash(trashed), at()).unwrap();
+        (vault, root, file, trashed)
+    }
+
+    #[test]
+    fn promotion_survives_pending_to_confirmed_timestamp_changes() {
+        let (pending, root, file, trashed) = promotion_fixture(12_000_000_000, false);
+        let (mut confirmed, _, _, _) = promotion_fixture(82_000_000_000, true);
+        let expected = pending.subtree_fingerprint(root).unwrap();
+        assert_eq!(expected, confirmed.subtree_fingerprint(root).unwrap());
+        assert_ne!(
+            pending.legacy_subtree_fingerprint(root).unwrap(),
+            confirmed.legacy_subtree_fingerprint(root).unwrap()
+        );
+        let space = Id::from(104);
+        assert_eq!(
+            confirmed.apply(
+                VaultAction::PromoteShared {
+                    id: root,
+                    space,
+                    expected,
+                },
+                Metadata {
+                    timestamp: 83_000_000_000,
+                    ..metadata()
+                },
+            ),
+            Ok(root)
+        );
+        assert_eq!(
+            confirmed.entries[&root].kind,
+            EntryKind::Shared {
+                space,
+                folder: true
+            }
+        );
+        assert!(confirmed.get(file).is_none());
+        assert!(confirmed.is_trashed(trashed));
+        assert_eq!(confirmed.entries[&trashed].parent, None);
+    }
+
+    #[test]
+    fn promotion_accepts_legacy_raw_entry_fingerprints() {
+        let (mut vault, root, file, _) = promotion_fixture(12_000_000_000, true);
+        // This is the exact original hash representation, including timestamps.
+        let entries: Vec<_> = vault.entries.values().collect();
+        let expected = Id::hash(&entries);
+        assert_ne!(expected, vault.subtree_fingerprint(root).unwrap());
+        assert_eq!(
+            vault.apply(
+                VaultAction::PromoteShared {
+                    id: root,
+                    space: Id::from(104),
+                    expected,
+                },
+                metadata(),
+            ),
+            Ok(root)
+        );
+        assert!(vault.get(file).is_none());
+    }
+
+    #[test]
+    fn promotion_still_rejects_semantic_changes_without_mutating() {
+        let (original, root, file, trashed) = promotion_fixture(12_000_000_000, true);
+        let expected = original.subtree_fingerprint(root).unwrap();
+        for change in ["rename", "blob", "move", "favorite", "trash", "restore"] {
+            let mut changed = original.clone();
+            match change {
+                "rename" => changed.entries.get_mut(&file).unwrap().name = "changed.txt".into(),
+                "blob" => {
+                    let EntryKind::File { blob, .. } =
+                        &mut changed.entries.get_mut(&file).unwrap().kind
+                    else {
+                        unreachable!()
+                    };
+                    *blob = Id::from(105);
+                }
+                "move" => changed.entries.get_mut(&file).unwrap().parent = None,
+                "favorite" => changed.entries.get_mut(&file).unwrap().favorite = true,
+                "trash" => changed.entries.get_mut(&file).unwrap().trashed_at = Some(13),
+                "restore" => changed.entries.get_mut(&trashed).unwrap().trashed_at = None,
+                _ => unreachable!(),
+            }
+            let before = changed.clone();
+            assert_eq!(
+                changed.apply(
+                    VaultAction::PromoteShared {
+                        id: root,
+                        space: Id::from(104),
+                        expected,
+                    },
+                    metadata(),
+                ),
+                Err(StorageError::Changed),
+                "{change}"
+            );
+            assert_eq!(changed, before, "{change}");
+        }
     }
 
     #[test]

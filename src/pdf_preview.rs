@@ -142,7 +142,7 @@ fn raster_size(width: f64, height: f64, rotation: i32) -> Result<(u32, u32), Str
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    fn fixture() -> Vec<u8> {
+    pub(crate) fn fixture() -> Vec<u8> {
         // Four colored quadrants make vertical orientation and /Rotate visible
         // in pixel assertions; page one also has a nonzero crop-box origin.
         let portrait = "1 0 0 rg 10 120 50 100 re f\n0 1 0 rg 60 120 50 100 re f\n0 0 1 rg 10 20 50 100 re f\n1 1 0 rg 60 20 50 100 re f\n";

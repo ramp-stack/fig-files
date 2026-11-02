@@ -8,8 +8,8 @@ use crate::{
 };
 use chk::{
     Action, AvatarContent, AvatarIconStyle, Bumper, Context, Display, Flow, FlowBuilder, Form,
-    FormComplete, FormItem, FormValidState, Icons, ListItem, Offset, Page, PageType, State, Theme,
-    Watch,
+    FormComplete, FormItem, FormValidState, Icons, ListItem, Offset, Page, PageType, State,
+    TableItem, Theme, Watch,
 };
 use prism::air::{Id, Instance};
 
@@ -32,7 +32,7 @@ fn unavailable(body: &str) -> PageType {
 /// A private library entry is only a link. Its displayed contents stay subscribed
 /// to the canonical shared contract, including after a recipient joins.
 pub(crate) fn mount(space: Id) -> Page {
-    Page::watching(
+    let fallback = Page::watching(
         Watch::list::<SharedSpace>(),
         move |ctx: &mut Context, theme: &Theme, spaces: Vec<Instance<SharedSpace>>| {
             let Some(instance) = spaces.into_iter().find(|instance| instance.id() == space) else {
@@ -43,16 +43,18 @@ pub(crate) fn mount(space: Id) -> Page {
             let root = instance.pending().root;
             render_item(ctx, theme, instance, root)
         },
-    )
+    );
+    crate::preview::page(crate::preview::Source::Mount(space), fallback)
 }
 
 pub(crate) fn item(space: Instance<SharedSpace>, id: EntryId) -> Page {
-    Page::watching(
-        Watch::contract(space),
+    let fallback = Page::watching(
+        Watch::contract(space.clone()),
         move |ctx: &mut Context, theme: &Theme, space: Instance<SharedSpace>| {
             render_item(ctx, theme, space, id)
         },
-    )
+    );
+    crate::preview::page(crate::preview::Source::Shared(space, id), fallback)
 }
 
 pub(crate) fn folder(space: Instance<SharedSpace>, id: EntryId) -> Page {
@@ -234,28 +236,47 @@ pub(crate) fn details(space: Instance<SharedSpace>, id: EntryId) -> Page {
     )
 }
 
-fn render_detail(
-    _: &mut Context,
-    _: &Theme,
+pub(crate) fn render_detail(
+    ctx: &mut Context,
+    theme: &Theme,
     space: Instance<SharedSpace>,
     entry: Entry,
 ) -> PageType {
     let state = space.pending();
+    if state.validate().is_err() || !state.is_ready() || !state.can_write(ctx.air.me()) {
+        return unavailable("Join this item from Shared first.");
+    }
+    let Some(entry) = state.tree.get(entry.id).cloned() else {
+        return unavailable("This item was removed.");
+    };
     let root = state.root;
     let trashed = state.tree.is_trashed(entry.id);
     let conflict_count = state.conflicts(entry.id).len();
+    let path = state
+        .tree
+        .breadcrumbs(entry.parent)
+        .into_iter()
+        .map(|parent| parent.name)
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let root_name = state.title().to_owned();
+    let shared_folder = state.is_folder();
     drop(state);
-    let mut body = vec![
-        Display::image(browser::entry_art(&entry), (112.0, 112.0)),
-        Display::label(&entry.name),
-        Display::instructions(&if entry.is_folder() {
-            "Shared folder · Everyone can edit".into()
-        } else {
-            format!("{} · Everyone can edit", storage::format_size(entry.size()))
-        }),
-    ];
-    if conflict_count > 0 {
-        body.push(Display::list(
+    let mut body = if !entry.is_folder() && !trashed {
+        Vec::new()
+    } else {
+        vec![
+            Display::image(browser::entry_art(&entry), (112.0, 112.0)),
+            Display::label(&entry.name),
+            Display::instructions(&if entry.is_folder() {
+                "Shared folder · Everyone can edit".into()
+            } else {
+                format!("{} · Everyone can edit", storage::format_size(entry.size()))
+            }),
+        ]
+    };
+    let conflict_notice = (conflict_count > 0).then(|| {
+        Display::list(
             None,
             vec![ListItem::plain(
                 "Edits to review",
@@ -264,7 +285,12 @@ fn render_detail(
                 Some(Flow::new(vec![conflicts_page(space.clone(), entry.id)])),
             )],
             None,
-        ));
+        )
+    });
+    if (entry.is_folder() || trashed)
+        && let Some(notice) = &conflict_notice
+    {
+        body.push(notice.clone());
     }
     if trashed {
         body.push(Display::instructions(
@@ -301,19 +327,84 @@ fn render_detail(
             Offset::Start,
         );
     }
+    if !entry.is_folder() {
+        body.push(Display::table(
+            "Details",
+            vec![
+                TableItem::new("Name", &entry.name),
+                TableItem::new("Kind", entry.mime()),
+                TableItem::new("Size", &storage::format_size(entry.size())),
+                TableItem::new(
+                    "Location",
+                    &if path.is_empty() {
+                        "Shared".into()
+                    } else {
+                        format!("Shared / {path}")
+                    },
+                ),
+                TableItem::new("Access", "Read and write for everyone with access"),
+            ],
+            None,
+        ));
+        let (delete_hint, delete) = if entry.id == root {
+            (
+                "Remove your Files shortcut; shared content stays available",
+                root_delete_page(ctx, space.id()),
+            )
+        } else {
+            (
+                "Move this file to Shared Trash for everyone",
+                delete_confirmation(space.clone(), entry.id, false),
+            )
+        };
+        let share_hint = if shared_folder {
+            format!("Share the entire shared folder “{root_name}”, including all files")
+        } else {
+            "Give contacts read and write access to this shared file".into()
+        };
+        body.push(Display::list(
+            None,
+            vec![
+                ListItem::plain(
+                    "Share",
+                    &share_hint,
+                    None,
+                    Some(sharing_ui::invite_flow(ctx, space.clone(), theme)),
+                ),
+                ListItem::plain("Delete", delete_hint, None, Some(Flow::new(vec![delete]))),
+                ListItem::plain(
+                    "Manage file",
+                    "Edit, replace, rename or move",
+                    None,
+                    Some(Flow::new(vec![manage_page(space.clone(), entry.id)])),
+                ),
+                ListItem::plain(
+                    "Export file",
+                    "Open a local copy in another app",
+                    None,
+                    Some(Flow::new(vec![export_page(space.clone(), entry.id)])),
+                ),
+                ListItem::plain(
+                    "Access",
+                    "View sharing details and people with access",
+                    None,
+                    Some(Flow::new(vec![sharing_ui::invitation_detail(
+                        space.clone(),
+                    )])),
+                ),
+            ],
+            None,
+        ));
+        if let Some(notice) = conflict_notice {
+            body.push(notice);
+        }
+        return PageType::display(&entry.name, body, None, Bumper::None, Offset::Start);
+    }
     body.push(Display::list(
         None,
         vec![ListItem::plain(
-            if entry.is_folder() {
-                "Manage folder"
-            } else {
-                "Manage file"
-            },
-            if entry.is_folder() {
-                "Rename or move"
-            } else {
-                "Edit, replace, rename or move"
-            },
+            "Manage folder",
+            "Rename or move",
             None,
             Some(Flow::new(vec![manage_page(space.clone(), entry.id)])),
         )],
@@ -326,37 +417,44 @@ fn render_detail(
             Flow::new(vec![sharing_ui::invitation_detail(header_space.clone())])
         }),
     ));
-    let bumper = if entry.is_folder() {
-        if root == entry.id {
-            let sharing = space.clone();
-            Bumper::custom(
-                "Share access",
-                Action::custom(move |ctx: &mut Context, theme: &Theme| {
-                    sharing_ui::invite_flow(sharing.clone(), theme).build(ctx, theme)(ctx, theme);
-                }),
-            )
-        } else {
-            Bumper::None
-        }
-    } else {
-        Bumper::custom(
-            "Preview",
-            native(FileEvent::SharedPreview(space.id(), entry.id)),
-        )
-    };
-    // The file header is the primary sharing affordance for the shared root.
-    let header = if root == entry.id && !entry.is_folder() {
+    let bumper = if root == entry.id {
         let sharing = space.clone();
-        Some((
-            Icons::Send,
-            Box::new(move |_: &mut Context, theme: &Theme| {
-                sharing_ui::invite_flow(sharing.clone(), theme)
-            }) as Box<dyn FlowBuilder>,
-        ))
+        Bumper::custom(
+            "Share access",
+            Action::custom(move |ctx: &mut Context, theme: &Theme| {
+                sharing_ui::invite_flow(ctx, sharing.clone(), theme).build(ctx, theme)(ctx, theme);
+            }),
+        )
     } else {
-        header
+        Bumper::None
     };
     PageType::display(&entry.name, body, header, bumper, Offset::Start)
+}
+
+fn root_delete_page(ctx: &Context, space: Id) -> Page {
+    let shortcut = ctx.air.instances::<storage::Vault>().list().into_values().find_map(|vault| {
+        let state = vault.pending();
+        if state.owner != ctx.air.me() { return None; }
+        let id = state.entries.values().find(|entry| {
+            matches!(entry.kind, storage::EntryKind::Shared { space: existing, .. } if existing == space)
+                && !state.is_trashed(entry.id)
+        }).map(|entry| entry.id);
+        drop(state);
+        id.map(|id| (vault, id))
+    });
+    if let Some((vault, id)) = shortcut {
+        browser::shortcut_delete_confirmation(vault, id)
+    } else {
+        Page::Static(Box::new(PageType::display(
+            "Shared file",
+            vec![Display::instructions(
+                "This shared file has no shortcut in your Files. The shared root cannot be deleted here and remains available to everyone with access.",
+            )],
+            None,
+            Bumper::None,
+            Offset::Start,
+        )))
+    }
 }
 
 pub(crate) fn add_page(space: Instance<SharedSpace>, parent: EntryId, theme: &Theme) -> Page {

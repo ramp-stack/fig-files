@@ -34,11 +34,11 @@ iOS development requires Xcode, a configured Cargo Piston developer identity, an
 - Browse Files, Shared, Contacts, and Trash. Recent and Favorites are no longer navigation pages.
 - Use the **Add files** bumper in Files or a folder to import files or create a folder. Imports are limited to **8 MiB each**. Search results are a browsing view without import controls.
 - Search file and folder names across the library with the header search button. Library item and byte totals appear below the listing.
-- Preview raster images, SVGs, PDFs (macOS/iOS), and UTF-8 text. Text previews are limited to 16,000 characters. Multi-page PDFs have a page button in the preview header for Previous, Next, or jumping to a page number.
+- Opening a file automatically previews raster images, SVGs, PDFs (macOS/iOS), and UTF-8 text, with file artwork while the preview loads. Text previews are limited to 16,000 characters. Use **Info → PDF pages** for Previous, Next, or jumping to a page number.
 - Rename, move, trash, and restore files or complete folder trees.
-- File details use **Preview** as the primary bumper. **Manage file** holds rename, move, and trash controls; folder details use the header manage button.
-- Use the header share button on a file, then **Export file**, to hand the original bytes to the system share sheet. Available destinations depend on the platform; iOS includes Save to Files. This is not a native Save As dialog.
-- Use **Send** on the Shared page to choose a file or folder, or use **Share access** from its details. Everyone who joins gets read and write access to the same item. Shared items remain accessible through shortcuts in Files.
+- The preview header’s **Info** button opens file details with **Share** and **Delete** rows. Delete confirms before moving files to Trash; deleting a shared root removes only your Files shortcut. **Manage file** holds rename/move and shared editing controls. Folder details use the header manage button.
+- Use **Info → Export file** on a file, to hand the original bytes to the system share sheet. Available destinations depend on the platform; iOS includes Save to Files. This is not a native Save As dialog.
+- Use **Send** on the Shared page to choose a file or folder, or use **Share** from a file’s Info page. Everyone who joins gets read and write access to the same item. Shared items remain accessible through shortcuts in Files.
 - Permanent deletion removes an item and its descendants from the library. AIR may retain earlier encrypted history; this is not secure erasure.
 
 The app starts with an empty library; it does not contain seeded demo files.
@@ -48,10 +48,12 @@ SVG previews support vector paths, text, gradients, and supported embedded raste
 ## Shared access
 
 1. The recipient opens **Shared → Receive** and copies their receiving name or shows its QR code.
-2. The sender opens **Shared → Send**, chooses a file or folder, pastes or scans the name, and confirms **Share access**.
+2. The sender opens **Shared → Send**, chooses a file or folder, searches and selects one or more contacts, and presses **Continue** to share read/write access. **New contact** opens the paste/QR page, then returns with that person selected.
 3. The recipient opens the invitation in **Shared** and chooses **Join shared file/folder**. A shortcut appears in Files. Both people now use the same shared contents.
 
 Shared presents one list of files and folders, whether you shared them or received access. **Send** and **Receive** are the main buttons. Private saved edits and older copy-based transfers are available from the information button when present.
+
+Sharing from file or folder details, including inviting someone to an existing shared item, uses the same CHK search and New contact forms as Orange's new-message flow. It includes saved contacts and people from sharing history. Selected people appear as removable chips, and adding someone keeps existing selections. Selecting or saving a contact does not grant access; **Continue** sends the invitations to the selected people for the same shared item.
 
 **Contacts → Add contact** lets you paste or scan someone’s Fig Files receiving name and save it before sharing anything. Contacts also fills automatically from people in your sharing history, including older copies. Adding the same name again opens the existing contact. Select a person, tap **Share files**, choose a file or folder, and confirm **Share access**. Their receiving name is already selected. Saved contacts persist privately across restarts and appear alongside sharing-history contacts without duplicates. Contacts show the full receiving name and any shared items that identify the relationship; merely opening a contact or choosing a file never grants access. Unaccepted incoming invitations do not add unfamiliar people to Contacts.
 

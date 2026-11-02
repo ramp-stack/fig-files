@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+pub const MAX_SPACE_MEMBERS: usize = 128;
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemberStatus {
     Invited,
@@ -166,6 +168,13 @@ pub enum CollaborationError {
     MissingConflict,
     ContentMismatch,
     Draft(crate::drafts::DraftError),
+    NoRecipients,
+    TooManyMembers,
+    PartialInvite {
+        sent: usize,
+        total: usize,
+        reason: String,
+    },
 }
 impl From<StorageError> for CollaborationError {
     fn from(error: StorageError) -> Self {
@@ -185,6 +194,9 @@ impl fmt::Display for CollaborationError {
             Self::RootOperation => f.write_str("The shared root cannot be moved or deleted here. Remove its shortcut from your own Files instead."),
             Self::MissingConflict => f.write_str("This saved conflict has already been resolved or removed."),
             Self::ContentMismatch => f.write_str("The file contents do not match this shared item."),
+            Self::NoRecipients => f.write_str("Select at least one contact to share with."),
+            Self::TooManyMembers => f.write_str("A shared item can include up to 128 people, including you. Select fewer new contacts."),
+            Self::PartialInvite { sent, total, reason } => write!(f, "Queued invitations for {sent} of {total} selected contacts. The remaining invitations were not queued. {reason}"),
         }
     }
 }
@@ -293,7 +305,7 @@ impl SharedSpace {
     pub fn validate(&self) -> Result<(), CollaborationError> {
         if self.tree.owner != self.owner
             || self.members.get(&self.owner) != Some(&MemberStatus::Active)
-            || self.members.len() > 128
+            || self.members.len() > MAX_SPACE_MEMBERS
         {
             return Err(CollaborationError::InvalidSpace);
         }
@@ -713,6 +725,67 @@ pub fn invite(
     space.share(recipient);
     Ok(())
 }
+
+fn normalize_recipients(
+    recipients: Vec<Name>,
+    signer: Name,
+) -> Result<Vec<Name>, CollaborationError> {
+    if recipients.is_empty() {
+        return Err(CollaborationError::NoRecipients);
+    }
+    if recipients.contains(&signer) {
+        return Err(CollaborationError::OwnName);
+    }
+    let recipients: BTreeSet<_> = recipients.into_iter().collect();
+    if recipients.len() >= MAX_SPACE_MEMBERS {
+        return Err(CollaborationError::TooManyMembers);
+    }
+    Ok(recipients.into_iter().collect())
+}
+
+fn prepare_recipients(
+    space: &SharedSpace,
+    signer: Name,
+    recipients: Vec<Name>,
+) -> Result<Vec<Name>, CollaborationError> {
+    space.validate()?;
+    space.authorize(signer)?;
+    let recipients = normalize_recipients(recipients, signer)?;
+    let additional = recipients
+        .iter()
+        .filter(|name| !space.members.contains_key(name))
+        .count();
+    if space.members.len().saturating_add(additional) > MAX_SPACE_MEMBERS {
+        return Err(CollaborationError::TooManyMembers);
+    }
+    Ok(recipients)
+}
+
+/// Preflight the whole selection before changing membership or forwarding this
+/// channel. Use the existing Grant wire format for each distinct recipient.
+/// These remain separate AIR actions; this is not a server-side transaction.
+pub fn invite_many(
+    air: &Air,
+    space: &mut Instance<SharedSpace>,
+    recipients: Vec<Name>,
+) -> Result<(), CollaborationError> {
+    let recipients = prepare_recipients(&space.pending(), air.me(), recipients)?;
+    let total = recipients.len();
+    for (sent, recipient) in recipients.into_iter().enumerate() {
+        if let Err(error) = invite(air, space, recipient) {
+            return Err(if sent == 0 {
+                error
+            } else {
+                CollaborationError::PartialInvite {
+                    sent,
+                    total,
+                    reason: error.to_string(),
+                }
+            });
+        }
+    }
+    Ok(())
+}
 pub fn join(
     air: &Air,
     vault: &mut Instance<Vault>,
@@ -740,9 +813,18 @@ pub fn share(
     id: EntryId,
     recipient: Name,
 ) -> Result<Instance<SharedSpace>, CollaborationError> {
-    if recipient == air.me() {
-        return Err(CollaborationError::OwnName);
-    }
+    share_with(air, vault, id, vec![recipient])
+}
+
+/// Promote a private item once, then grant the complete recipient batch. All
+/// recipient validation happens before creating a space or changing the Vault.
+pub fn share_with(
+    air: &Air,
+    vault: &mut Instance<Vault>,
+    id: EntryId,
+    recipients: Vec<Name>,
+) -> Result<Instance<SharedSpace>, CollaborationError> {
+    let recipients = normalize_recipients(recipients, air.me())?;
     let snapshot = vault.pending();
     if snapshot.owner != air.me() {
         return Err(CollaborationError::Unauthorized);
@@ -752,7 +834,7 @@ pub fn share(
     if let EntryKind::Shared { space, .. } = entry.kind {
         let mut space = get(air, space)?;
         drop(snapshot);
-        invite(air, &mut space, recipient)?;
+        invite_many(air, &mut space, recipients)?;
         return Ok(space);
     }
     let mut items = Vec::new();
@@ -813,7 +895,7 @@ pub fn share(
     }
     dispatch(air, &mut space, SharedAction::Activate)?;
     storage::promote_shared(vault, id, space.id(), expected)?;
-    invite(air, &mut space, recipient)?;
+    invite_many(air, &mut space, recipients)?;
     Ok(space)
 }
 fn edit(
@@ -1143,6 +1225,226 @@ mod tests {
             ),
             Err(CollaborationError::OwnName)
         );
+    }
+
+    #[test]
+    fn recipient_preflight_checks_the_entire_batch_without_changing_members() {
+        let (alice, bob, mut space, _, _) = fixture();
+        let charlie = air::Secret::new().name();
+        join_member(&mut space, alice.name(), bob.name());
+        apply(&mut space, alice.name(), SharedAction::Grant(charlie)).unwrap();
+        apply(&mut space, charlie, SharedAction::Decline).unwrap();
+        let before = space.members.clone();
+        for (signer, recipients, error) in [
+            (alice.name(), vec![], CollaborationError::NoRecipients),
+            (
+                alice.name(),
+                vec![charlie, alice.name()],
+                CollaborationError::OwnName,
+            ),
+            (charlie, vec![bob.name()], CollaborationError::Unauthorized),
+        ] {
+            assert_eq!(prepare_recipients(&space, signer, recipients), Err(error));
+            assert_eq!(space.members, before);
+        }
+        while space.members.len() < MAX_SPACE_MEMBERS - 1 {
+            space
+                .members
+                .insert(air::Secret::new().name(), MemberStatus::Invited);
+        }
+        let first = air::Secret::new().name();
+        let second = air::Secret::new().name();
+        let before = space.members.clone();
+        assert_eq!(
+            prepare_recipients(&space, bob.name(), vec![charlie, first, second, first]),
+            Err(CollaborationError::TooManyMembers)
+        );
+        assert_eq!(
+            space.members, before,
+            "Rejected preflight must not reinvite declined members or add a subset"
+        );
+        let recipients =
+            prepare_recipients(&space, bob.name(), vec![charlie, first, first]).unwrap();
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(
+            space.members, before,
+            "Successful preflight is also read-only"
+        );
+        for recipient in recipients {
+            apply(&mut space, bob.name(), SharedAction::Grant(recipient)).unwrap();
+        }
+        assert_eq!(space.members.len(), MAX_SPACE_MEMBERS);
+        assert_eq!(space.members[&charlie], MemberStatus::Invited);
+        assert_eq!(space.members[&first], MemberStatus::Invited);
+        assert_eq!(space.members[&bob.name()], MemberStatus::Active);
+        // Existing recipients and duplicates consume no additional slots.
+        for recipient in
+            prepare_recipients(&space, alice.name(), vec![bob.name(), first, first]).unwrap()
+        {
+            apply(&mut space, alice.name(), SharedAction::Grant(recipient)).unwrap();
+        }
+        assert_eq!(space.members[&bob.name()], MemberStatus::Active);
+        let before = space.members.clone();
+        assert_eq!(
+            prepare_recipients(&space, alice.name(), vec![second]),
+            Err(CollaborationError::TooManyMembers)
+        );
+        assert_eq!(
+            apply(&mut space, alice.name(), SharedAction::Grant(second)),
+            Err(CollaborationError::InvalidSpace)
+        );
+        assert_eq!(
+            space.members, before,
+            "The original Grant behavior remains unchanged"
+        );
+    }
+
+    #[test]
+    fn recipient_normalization_rejects_invalid_batches_and_preserves_action_wire_tags() {
+        let owner = air::Secret::new().name();
+        let peer = air::Secret::new().name();
+        assert_eq!(
+            normalize_recipients(vec![], owner),
+            Err(CollaborationError::NoRecipients)
+        );
+        assert_eq!(
+            normalize_recipients(vec![peer, owner], owner),
+            Err(CollaborationError::OwnName)
+        );
+        assert_eq!(
+            normalize_recipients(vec![peer; MAX_SPACE_MEMBERS * 2], owner).unwrap(),
+            vec![peer]
+        );
+        let too_many: Vec<_> = (0..MAX_SPACE_MEMBERS)
+            .map(|_| air::Secret::new().name())
+            .collect();
+        assert_eq!(
+            normalize_recipients(too_many, owner),
+            Err(CollaborationError::TooManyMembers)
+        );
+        let id = Id::random();
+        let previous = [
+            SharedAction::Upload {
+                id,
+                bytes: Vec::new(),
+            },
+            SharedAction::Activate,
+            SharedAction::Grant(peer),
+            SharedAction::Join,
+            SharedAction::Decline,
+            SharedAction::Edit(VaultAction::Trash(id)),
+            SharedAction::Import {
+                id,
+                parent: id,
+                name: "name".into(),
+                mime: "text/plain".into(),
+                bytes: Vec::new(),
+            },
+            SharedAction::Replace {
+                id,
+                expected: id,
+                version: id,
+                bytes: Vec::new(),
+            },
+            SharedAction::Resolve {
+                id,
+                conflict: id,
+                expected: id,
+            },
+            SharedAction::DiscardConflict { id, conflict: id },
+        ];
+        for (tag, action) in previous.into_iter().enumerate() {
+            assert_eq!(postcard::to_allocvec(&action).unwrap()[0], tag as u8);
+        }
+    }
+
+    #[test]
+    fn original_grants_deliver_the_same_encrypted_space_to_multiple_people() {
+        let (alice, bob, state, root, file) = fixture();
+        let charlie = air::Secret::new();
+        let mut catalog = air::Air::new(alice.clone()).unwrap();
+        let mut sender = catalog
+            .create::<SharedSpace>(SharedInit {
+                nonce: Id::random(),
+                root,
+                items: state.tree.entries.values().cloned().collect(),
+            })
+            .unwrap();
+        sender
+            .send(SharedAction::Upload {
+                id: file,
+                bytes: b"original".to_vec(),
+            })
+            .unwrap();
+        sender.send(SharedAction::Activate).unwrap();
+        let recipients = prepare_recipients(
+            sender.pending().unwrap(),
+            alice.name(),
+            vec![bob.name(), charlie.name(), bob.name()],
+        )
+        .unwrap();
+        for recipient in recipients {
+            sender.send(SharedAction::Grant(recipient)).unwrap();
+        }
+        let mut resolver = air::DefaultResolver::default();
+        for name in [bob.name(), charlie.name()] {
+            ready(catalog.share(&mut resolver, name, *sender.location()));
+        }
+        let mut sender: air::Instance<SharedSpace> =
+            postcard::from_bytes(&postcard::to_allocvec(&sender).unwrap()).unwrap();
+        let mut catalog: air::Air =
+            postcard::from_bytes(&postcard::to_allocvec(&catalog).unwrap()).unwrap();
+        let mut server = TestServer::new();
+        server.sync_catalog(&mut catalog);
+        server.sync(&mut sender);
+        let mut receivers = Vec::new();
+        for secret in [bob, charlie] {
+            let mut catalog = air::Air::new(secret.clone()).unwrap();
+            server.sync_catalog(&mut catalog);
+            assert!(catalog.list(&Vault::id()).is_empty());
+            assert!(catalog.list(&storage::FileBlob::id()).is_empty());
+            let locations = catalog.list(&SharedSpace::id());
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations.iter().next(), Some(sender.location()));
+            let mut receiver =
+                air::Instance::<SharedSpace>::receive(secret.clone(), *sender.location()).unwrap();
+            server.sync(&mut receiver);
+            assert_eq!(
+                receiver.pending().unwrap().members[&secret.name()],
+                MemberStatus::Invited
+            );
+            receiver.send(SharedAction::Join).unwrap();
+            server.sync(&mut receiver);
+            receivers.push(receiver);
+        }
+        server.sync(&mut sender);
+        assert_eq!(sender.pending().unwrap().members.len(), 3);
+        assert!(
+            sender
+                .pending()
+                .unwrap()
+                .members
+                .values()
+                .all(|status| *status == MemberStatus::Active)
+        );
+        let expected = sender.pending().unwrap().content_hash(file).unwrap();
+        sender
+            .send(SharedAction::Replace {
+                id: file,
+                expected,
+                version: Id::random(),
+                bytes: b"same shared contents".to_vec(),
+            })
+            .unwrap();
+        server.sync(&mut sender);
+        for receiver in &mut receivers {
+            server.sync(receiver);
+            assert_eq!(receiver.id(), sender.id());
+            assert_eq!(
+                receiver.pending().unwrap().read_file(file).unwrap(),
+                b"same shared contents"
+            );
+        }
     }
     #[test]
     fn replacements_preserve_concurrent_bytes_and_resolution_is_an_atomic_swap() {

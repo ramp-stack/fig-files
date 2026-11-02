@@ -2,31 +2,20 @@
 use crate::{
     browser,
     collaboration::{self, MemberStatus, SharedSpace},
-    collaboration_ui,
+    collaboration_ui, contacts_ui,
     drafts::EditDraft,
     sharing::{self, Transfer, TransferStatus},
     storage::{self, EntryId, Vault},
 };
 use chk::{
     Action, AvatarContent, AvatarIconStyle, Bumper, Context, Display, Flow, Form, FormAction,
-    FormComplete, FormItem, FormValidState, Icons, ListItem, Offset, Page, PageType, State, Theme,
-    Watch,
+    FormComplete, FormItem, Icons, ListItem, Offset, Page, PageType, State, Theme, Watch,
 };
 use prism::air::{Instance, Name};
 
 fn short_name(name: Name) -> String {
     let full = name.to_string();
     format!("{}…{}", &full[..10], &full[full.len() - 8..])
-}
-
-pub(crate) fn recipient(text: &str, me: Name) -> Result<Name, String> {
-    let name = text.trim().parse::<Name>().map_err(|_| {
-        "Paste a complete Fig Files receiving name, or scan its QR code.".to_string()
-    })?;
-    if name == me {
-        return Err("Choose another person’s name.".into());
-    }
-    Ok(name)
 }
 
 pub fn receive_name(name: Name) -> Page {
@@ -477,6 +466,7 @@ pub(crate) fn send_picker_for(name: Name) -> Page {
 }
 
 pub(crate) fn picker_selection(
+    ctx: &mut Context,
     vault: Instance<Vault>,
     id: EntryId,
     recipient: Option<Name>,
@@ -484,7 +474,7 @@ pub(crate) fn picker_selection(
 ) -> Flow {
     match recipient {
         Some(name) => Flow::new(vec![send_confirmation(vault, id, name)]),
-        None => send_flow(vault, id, theme),
+        None => send_flow(ctx, vault, id, theme),
     }
 }
 
@@ -546,7 +536,7 @@ fn file_picker(recipient: Option<Name>) -> Page {
                         &entry.name,
                         &format!("{path} · {kind}"),
                         None,
-                        Some(picker_selection(vault, entry.id, recipient, theme)),
+                        Some(picker_selection(ctx, vault, entry.id, recipient, theme)),
                     )
                 })
                 .collect();
@@ -814,31 +804,49 @@ fn decline_confirmation(instance: Instance<Transfer>) -> Page {
     )))
 }
 
-pub fn send_flow(vault: Instance<Vault>, id: EntryId, theme: &Theme) -> Flow {
+pub fn send_flow(ctx: &mut Context, vault: Instance<Vault>, id: EntryId, theme: &Theme) -> Flow {
+    recipient_flow(ctx, theme, move |ctx: &mut Context, names: Vec<Name>| {
+        match collaboration::share_with(&ctx.air, &mut vault.clone(), id, names) {
+            Ok(space) => {
+                let root = space.pending().root;
+                FormComplete::Next(collaboration_ui::item(space, root))
+            }
+            Err(error) => {
+                FormComplete::Next(browser::message("Could not share", &error.to_string()))
+            }
+        }
+    })
+}
+
+fn recipient_flow(
+    ctx: &mut Context,
+    theme: &Theme,
+    share: impl Fn(&mut Context, Vec<Name>) -> FormComplete + Clone + 'static,
+) -> Flow {
+    let items = contacts_ui::search_items(ctx);
     Flow::from_form(Form::flow(
         theme,
-        vec![FormItem::text(
+        vec![FormItem::search(
             "Share access",
-            "recipient’s Fig Files receiving name",
-            Some(vec![
-                FormAction::Paste,
-                FormAction::scan_qr_code("Scan the recipient’s Fig Files receiving name"),
-            ]),
-            |ctx: &mut Context, text: String| match recipient(&text, ctx.air.me()) {
-                Ok(_) => FormValidState::Valid,
-                Err(error) => FormValidState::InvalidWithData(error),
-            },
+            "contact name",
+            items,
+            Some(vec![FormAction::Custom(
+                "New contact".into(),
+                None,
+                Icons::Add,
+                Action::flow(Flow::from_form(contacts_ui::new_contact(theme))),
+            )]),
         )],
         None,
         None,
         Box::new(move |ctx: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(text)) = states.first() else {
+            let Some(State::Search(names)) = states.first() else {
                 return FormComplete::None;
             };
-            match recipient(text, ctx.air.me()) {
-                Ok(name) => FormComplete::Next(send_confirmation(vault.clone(), id, name)),
-                Err(error) => FormComplete::Next(browser::message("Check recipient", &error)),
+            if names.is_empty() {
+                return FormComplete::None;
             }
+            share(ctx, names.clone())
         }),
     ))
 }
@@ -906,66 +914,14 @@ pub(crate) fn send_confirmation(vault: Instance<Vault>, id: EntryId, name: Name)
     )
 }
 
-pub fn invite_flow(space: Instance<SharedSpace>, theme: &Theme) -> Flow {
-    Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::text(
-            "Share access",
-            "recipient’s Fig Files receiving name",
-            Some(vec![
-                FormAction::Paste,
-                FormAction::scan_qr_code("Scan the recipient’s Fig Files receiving name"),
-            ]),
-            |ctx: &mut Context, text: String| match recipient(&text, ctx.air.me()) {
-                Ok(_) => FormValidState::Valid,
-                Err(error) => FormValidState::InvalidWithData(error),
-            },
-        )],
-        None,
-        None,
-        Box::new(move |ctx: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(text)) = states.first() else {
-                return FormComplete::None;
-            };
-            match recipient(text, ctx.air.me()) {
-                Ok(name) => FormComplete::Next(invite_confirmation(space.clone(), name)),
-                Err(error) => FormComplete::Next(browser::message("Check recipient", &error)),
-            }
-        }),
-    ))
-}
-
-fn invite_confirmation(space: Instance<SharedSpace>, name: Name) -> Page {
-    let (title, folder) = {
-        let snapshot = space.pending();
-        (snapshot.title().to_owned(), snapshot.is_folder())
-    };
-    let invite =
-        Action::custom(move |ctx: &mut Context, theme: &Theme| {
-            match collaboration::invite(&ctx.air, &mut space.clone(), name) {
-                Ok(()) => FormComplete::Next(invitation_detail(space.clone())).run(ctx, theme),
-                Err(error) => FormComplete::Next(browser::message(
-                    "Could not share access",
-                    &error.to_string(),
-                ))
-                .run(ctx, theme),
-            }
-        });
-    Page::Static(Box::new(PageType::display(
-        "Share access",
-        vec![
-            Display::label(&title),
-            Display::label("To"),
-            Display::text(&name.to_string()),
-            Display::label("Read & write access"),
-            Display::instructions(if folder {
-                "This invitation grants access to the entire shared folder, including all files and subfolders. Everyone edits the same contents."
-            } else {
-                "This invitation grants access to the shared file. Everyone edits the same contents."
-            }),
-        ],
-        None,
-        Bumper::double("Share access", invite, "Cancel", Action::None),
-        Offset::Start,
-    )))
+pub fn invite_flow(ctx: &mut Context, space: Instance<SharedSpace>, theme: &Theme) -> Flow {
+    recipient_flow(ctx, theme, move |ctx: &mut Context, names: Vec<Name>| {
+        match collaboration::invite_many(&ctx.air, &mut space.clone(), names) {
+            Ok(()) => FormComplete::Next(invitation_detail(space.clone())),
+            Err(error) => FormComplete::Next(browser::message(
+                "Could not share access",
+                &error.to_string(),
+            )),
+        }
+    })
 }

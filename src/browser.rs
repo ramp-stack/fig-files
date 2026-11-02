@@ -247,9 +247,16 @@ pub fn listing(vault: Instance<Vault>, location: Location, root: bool) -> Page {
 }
 
 pub fn detail(vault: Instance<Vault>, id: EntryId) -> Page {
+    crate::preview::page(
+        crate::preview::Source::Private(vault.clone(), id),
+        info(vault, id),
+    )
+}
+
+pub(crate) fn info(vault: Instance<Vault>, id: EntryId) -> Page {
     Page::watching(
         Watch::contract(vault),
-        move |_ctx: &mut Context, _: &Theme, vault: Instance<Vault>| {
+        move |ctx: &mut Context, theme: &Theme, vault: Instance<Vault>| {
             let snapshot = vault.pending();
             let Some(entry) = snapshot.get(id).cloned() else {
                 return PageType::display(
@@ -298,29 +305,34 @@ pub fn detail(vault: Instance<Vault>, id: EntryId) -> Page {
                 format_size(entry.size())
             };
             drop(snapshot);
-            let mut displays = vec![
-                Display::image(entry_art(&entry), (112.0, 112.0)),
-                Display::label(&entry.name),
-                Display::table(
-                    "Details",
-                    vec![
-                        TableItem::new("Kind", &file_kind(&entry)),
-                        TableItem::new("Size", &size),
-                        TableItem::new(
-                            "Location",
-                            &format!(
-                                "Files{}",
-                                if path.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" / {}", path.join(" / "))
-                                }
-                            ),
-                        ),
-                    ],
-                    None,
+            let mut metadata = vec![
+                TableItem::new("Kind", &file_kind(&entry)),
+                TableItem::new("Size", &size),
+                TableItem::new(
+                    "Location",
+                    &format!(
+                        "Files{}",
+                        if path.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" / {}", path.join(" / "))
+                        }
+                    ),
                 ),
             ];
+            if !entry.is_folder() && !trashed {
+                metadata.insert(0, TableItem::new("Name", &entry.name));
+                metadata.push(TableItem::new("Access", "Only you"));
+            }
+            let mut displays = if !entry.is_folder() && !trashed {
+                vec![Display::table("Details", metadata, None)]
+            } else {
+                vec![
+                    Display::image(entry_art(&entry), (112.0, 112.0)),
+                    Display::label(&entry.name),
+                    Display::table("Details", metadata, None),
+                ]
+            };
             let (header, bumper) = if trashed {
                 let delete_vault = vault.clone();
                 let restore_vault = vault.clone();
@@ -358,7 +370,7 @@ pub fn detail(vault: Instance<Vault>, id: EntryId) -> Page {
                     Bumper::custom(
                         "Share folder",
                         Action::custom(move |ctx: &mut Context, theme: &Theme| {
-                            crate::sharing_ui::send_flow(share_vault.clone(), id, theme)
+                            crate::sharing_ui::send_flow(ctx, share_vault.clone(), id, theme)
                                 .build(ctx, theme)(ctx, theme);
                         }),
                     ),
@@ -366,28 +378,51 @@ pub fn detail(vault: Instance<Vault>, id: EntryId) -> Page {
             } else {
                 displays.push(Display::list(
                     None,
-                    vec![ListItem::plain(
-                        "Manage file",
-                        "Rename, move or delete",
-                        None,
-                        Some(Flow::new(vec![manage_page(vault.clone(), id)])),
-                    )],
+                    vec![
+                        ListItem::plain(
+                            "Share",
+                            "Give contacts read and write access",
+                            None,
+                            Some(crate::sharing_ui::send_flow(ctx, vault.clone(), id, theme)),
+                        ),
+                        ListItem::plain(
+                            "Delete",
+                            "Move this file to Trash",
+                            None,
+                            Some(Flow::new(vec![confirmation(vault.clone(), id, false)])),
+                        ),
+                        ListItem::plain(
+                            "Manage file",
+                            "Rename or move",
+                            None,
+                            Some(Flow::new(vec![manage_page(vault.clone(), id)])),
+                        ),
+                        ListItem::plain(
+                            "Export file",
+                            "Open a local copy in another app",
+                            None,
+                            Some(Flow::new(vec![export_page(id)])),
+                        ),
+                    ],
                     None,
                 ));
-                let share_vault = vault.clone();
-                (
-                    Some((
-                        Icons::Send,
-                        Box::new(move |_: &mut Context, theme: &Theme| {
-                            Flow::new(vec![share_page(share_vault.clone(), id, theme)])
-                        }) as Box<dyn FlowBuilder>,
-                    )),
-                    Bumper::custom("Preview", file_action(FileEvent::Preview(id))),
-                )
+                (None, Bumper::None)
             };
             PageType::display(&entry.name, displays, header, bumper, Offset::Start)
         },
     )
+}
+
+fn export_page(id: EntryId) -> Page {
+    Page::Static(Box::new(PageType::display(
+        "Export file",
+        vec![Display::instructions(
+            "Save a copy or open this file in another app.",
+        )],
+        None,
+        Bumper::custom("Export file", file_action(FileEvent::Export(id))),
+        Offset::Start,
+    )))
 }
 
 /// The Add button opens one small chooser; the native picker is only invoked
@@ -415,57 +450,6 @@ pub(crate) fn add_page(vault: Instance<Vault>, parent: Option<EntryId>, theme: &
         Bumper::custom("Import files", file_action(FileEvent::Import(parent))),
         Offset::Start,
     )))
-}
-
-pub(crate) fn share_page(vault: Instance<Vault>, id: EntryId, _theme: &Theme) -> Page {
-    Page::watching(
-        Watch::contract(vault),
-        move |_: &mut Context, _: &Theme, vault: Instance<Vault>| {
-            let snapshot = vault.pending();
-            let Some(entry) = snapshot.get(id).filter(|_| !snapshot.is_trashed(id)) else {
-                return PageType::display(
-                    "Item unavailable",
-                    vec![Display::instructions(
-                        "This item is no longer available to share.",
-                    )],
-                    None,
-                    Bumper::Done,
-                    Offset::Start,
-                );
-            };
-            let send_vault = vault.clone();
-            let send = Action::custom(move |ctx: &mut Context, theme: &Theme| {
-                crate::sharing_ui::send_flow(send_vault.clone(), id, theme).build(ctx, theme)(
-                    ctx, theme,
-                );
-            });
-            let bumper = if entry.is_folder() {
-                Bumper::custom("Share access", send)
-            } else {
-                // CHK's secondary bumper returns to the file after opening the
-                // native share sheet. It does not push another in-app flow.
-                Bumper::double(
-                    "Share access",
-                    send,
-                    "Export file",
-                    file_action(FileEvent::Export(id)),
-                )
-            };
-            PageType::display(
-                "Share",
-                vec![
-                    Display::image(entry_art(entry), (96.0, 96.0)),
-                    Display::label(&entry.name),
-                    Display::instructions(
-                        "Share access using a Fig Files receiving name or QR code. Everyone who joins can read and edit the same file or folder.",
-                    ),
-                ],
-                None,
-                bumper,
-                Offset::Start,
-            )
-        },
-    )
 }
 
 pub(crate) fn manage_page(vault: Instance<Vault>, id: EntryId) -> Page {
@@ -971,36 +955,7 @@ pub(crate) fn shortcut_page(vault: Instance<Vault>, id: EntryId) -> Page {
                 Some((
                     Icons::Delete,
                     Box::new(move |_: &mut Context, _: &Theme| {
-                        let deleting = deleting.clone();
-                        Flow::new(vec![Page::Static(Box::new(PageType::display(
-                            "Remove shortcut",
-                            vec![Display::instructions(
-                                "Move this shortcut to your Trash? Shared files remain available to everyone, and you can still open them from Shared.",
-                            )],
-                            None,
-                            Bumper::double(
-                                "Remove shortcut",
-                                Action::custom(move |ctx: &mut Context, theme: &Theme| {
-                                    match storage::trash(&mut deleting.clone(), id) {
-                                        Ok(_) => FormComplete::Return(Box::new(
-                                            |_: &mut Context, _: &Theme| {},
-                                        ))
-                                        .run(ctx, theme),
-                                        Err(error) => show(
-                                            ctx,
-                                            theme,
-                                            message(
-                                                "Could not remove shortcut",
-                                                &error.to_string(),
-                                            ),
-                                        ),
-                                    }
-                                }),
-                                "Cancel",
-                                Action::None,
-                            ),
-                            Offset::Start,
-                        )))])
+                        Flow::new(vec![shortcut_delete_confirmation(deleting.clone(), id)])
                     }),
                 )),
                 Bumper::None,
@@ -1008,4 +963,31 @@ pub(crate) fn shortcut_page(vault: Instance<Vault>, id: EntryId) -> Page {
             )
         },
     )
+}
+
+pub(crate) fn shortcut_delete_confirmation(vault: Instance<Vault>, id: EntryId) -> Page {
+    Page::Static(Box::new(PageType::display(
+        "Remove shortcut",
+        vec![Display::instructions(
+            "Move this shortcut to your Trash? Shared files remain available to everyone, and you can still open them from Shared.",
+        )],
+        None,
+        Bumper::double(
+            "Remove shortcut",
+            Action::custom(move |ctx: &mut Context, theme: &Theme| {
+                match storage::trash(&mut vault.clone(), id) {
+                    Ok(_) => FormComplete::Return(Box::new(|_: &mut Context, _: &Theme| {}))
+                        .run(ctx, theme),
+                    Err(error) => show(
+                        ctx,
+                        theme,
+                        message("Could not remove shortcut", &error.to_string()),
+                    ),
+                }
+            }),
+            "Cancel",
+            Action::None,
+        ),
+        Offset::Start,
+    )))
 }

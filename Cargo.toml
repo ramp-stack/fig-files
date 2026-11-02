@@ -10,6 +10,7 @@ repository = "https://github.com/ramp-stack/fig-files"
 ramp = {package = "ramp2", version = "3.0.3"}
 chk = {path = "../chk"}
 
+futures = "0.3.34"
 include_dir = "0.7.4"
 serde = {version = "1", features = ["derive"]}
 prism = {package = "prism2", version = "3.1.0"}
@@ -27,7 +28,6 @@ crate-type=["staticlib", "cdylib", "rlib"]
 air = "4.0.1"
 postcard = {version = "1.1", features = ["alloc"]}
 media = {package = "media2", version = "0.1.1"}
-futures = "0.3.34"
 
 [profile.dev.package.swash]
 opt-level = 3
@@ -84,6 +84,12 @@ team = "RYYG6X8WK7"
 topic = "org.ramp.figfiles"
 identity = "023c8a09189d12e0755e224a9e8a6af15b21186758aef12e65b0231757dd3bdee0"
 application = "e94d20d0117656cc0a823abc0a355e61e1d0a78b956f754c7d94ac7376146125"
+
+[package.metadata.piston.notifications.macos.development]
+team = "RYYG6X8WK7"
+topic = "org.ramp.fig-files"
+identity = "023c8a09189d12e0755e224a9e8a6af15b21186758aef12e65b0231757dd3bdee0"
+application = "e4cb0c447e8ea1318948162355cb3bcf1182354421ec0749eb547a2726b4d38a"
 
 [package.metadata.piston.testflight]
 app_id = "6827364951"

@@ -8,7 +8,7 @@ use prism::{
     air::{Air, Id},
     drawable::{Area, Component, Drawable, Layout},
     events::{ChildEvent, DynEvent, Event, OnChange, OnEvent, on_change, on_event},
-    hardware::{Data, Image, PickResult, Picked},
+    hardware::{Data, PickResult, Picked},
 };
 use std::{
     fmt, fs,
@@ -19,12 +19,8 @@ use std::{
 #[derive(Clone, Debug)]
 pub enum FileEvent {
     Import(Option<EntryId>),
-    Preview(EntryId),
-    PdfPage(EntryId, usize),
     Export(EntryId),
     SharedImport(Id, EntryId),
-    SharedPreview(Id, EntryId),
-    SharedPdfPage(Id, EntryId, usize),
     SharedExport(Id, EntryId),
     SharedReplace(Id, EntryId),
     SharedExportConflict(Id, EntryId, Id),
@@ -32,19 +28,10 @@ pub enum FileEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FileSource {
+pub(crate) enum FileSource {
     Private(EntryId),
     Shared(Id, EntryId),
 }
-impl FileSource {
-    fn pdf_event(self, page: usize) -> FileEvent {
-        match self {
-            Self::Private(id) => FileEvent::PdfPage(id, page),
-            Self::Shared(space, id) => FileEvent::SharedPdfPage(space, id, page),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 enum PickerDestination {
     Private(Option<EntryId>),
@@ -336,142 +323,13 @@ impl FileRuntime {
         }
     }
 
-    fn open_file(&self, ctx: &mut Context, source: FileSource, preview: bool) {
-        let (entry, bytes) = match load_file(&ctx.air, source) {
-            Ok(file) => file,
-            Err(error) => {
-                self.notice(ctx, "File unavailable", &error);
-                return;
-            }
-        };
-        if preview {
-            if entry.mime() == "image/svg+xml" || entry.extension() == "svg" {
-                let font = self
-                    .theme
-                    .fonts()
-                    .get_font("FontStyle::Text")
-                    .map(|font| font.bytes());
-                match crate::svg_preview::render_with_font(&bytes, font) {
-                    Ok(image) => self.show_preview(ctx, &image, None),
-                    Err(error) => self.notice(ctx, "Preview unavailable", &error),
-                }
-                return;
-            }
-            if entry.mime() == "application/pdf" || entry.extension() == "pdf" {
-                self.show_pdf(ctx, source, &bytes, 0);
-                return;
-            }
-            if entry.mime().starts_with("image/") {
-                if !safe_image_dimensions(&bytes) {
-                    self.notice(ctx, "Preview unavailable", "This image is too large or its format is unsupported. Use Share → Export file to open the original.");
-                    return;
-                }
-                if let Ok(image) = Image::read(bytes.as_slice())
-                    && let Some(photo) = chk::air::messages::Photo::from_image(&image)
-                {
-                    browser::show(
-                        ctx,
-                        &self.theme,
-                        chk::Page::Static(Box::new(chk::PageType::photo(photo, None))),
-                    );
-                    return;
-                }
-            }
-            if let Ok(text) = std::str::from_utf8(&bytes) {
-                if !text.contains('\0') {
-                    let mut excerpt: String = text.chars().take(16_000).collect();
-                    if text.chars().nth(16_000).is_some() {
-                        excerpt.push_str("\n\n[Preview shortened. Export for the complete file.]");
-                    }
-                    if excerpt.is_empty() {
-                        excerpt = "This file is empty.".into();
-                    }
-                    browser::show(
-                        ctx,
-                        &self.theme,
-                        chk::Page::Static(Box::new(chk::PageType::display(
-                            &entry.name,
-                            vec![chk::Display::text(&excerpt)],
-                            None,
-                            chk::Bumper::Done,
-                            chk::Offset::Start,
-                        ))),
-                    );
-                    return;
-                }
-            }
-            self.notice(
-                ctx,
-                "Preview unavailable",
-                "Use Share → Export file to open this file in an app that supports its format.",
-            );
-        } else {
-            match write_export(&entry.name, &bytes) {
+    fn export_file(&self, ctx: &mut Context, source: FileSource) {
+        match load_file(&ctx.air, source) {
+            Ok((entry, bytes)) => match write_export(&entry.name, &bytes) {
                 Ok(path) => ctx.hardware.share(&Data::File(path)),
                 Err(error) => self.notice(ctx, "Could not export", &error.to_string()),
-            }
-        }
-    }
-
-    fn show_preview(
-        &self,
-        ctx: &mut Context,
-        image: &Image,
-        header: Option<(chk::Icons, Box<dyn chk::FlowBuilder>)>,
-    ) {
-        if let Some(photo) = chk::air::messages::Photo::encode(image, 1600, 95) {
-            browser::show(
-                ctx,
-                &self.theme,
-                chk::Page::Static(Box::new(chk::PageType::photo(photo, header))),
-            );
-        } else {
-            self.notice(
-                ctx,
-                "Preview unavailable",
-                "This document could not be displayed.",
-            );
-        }
-    }
-
-    fn show_pdf(&self, ctx: &mut Context, source: FileSource, bytes: &[u8], page: usize) {
-        match crate::pdf_preview::render(bytes, page) {
-            Ok((image, count)) => {
-                let header = (count > 1).then(|| {
-                    (
-                        chk::Icons::Credential,
-                        Box::new(move |_: &mut Context, theme: &Theme| match source {
-                            FileSource::Private(id) => pdf_pages(id, page, count, theme),
-                            FileSource::Shared(_, _) => pdf_pages_for(source, page, count, theme),
-                        }) as Box<dyn chk::FlowBuilder>,
-                    )
-                });
-                self.show_preview(ctx, &image, header);
-            }
-            Err(error) => self.notice(ctx, "Preview unavailable", &error),
-        }
-    }
-
-    fn open_pdf_page(&self, ctx: &mut Context, source: FileSource, page: usize) {
-        match load_file(&ctx.air, source) {
-            Ok((_, bytes)) => {
-                // Page selection closes the previous viewer/selector flow.
-                // Rebuild a constant two-page navigation stack, with file
-                // details behind the image, rather than stacking each page.
-                let detail = match source {
-                    FileSource::Private(id) => browser::detail(storage::open(&ctx.air), id),
-                    FileSource::Shared(space, id) => match collaboration::get(&ctx.air, space) {
-                        Ok(space) => collaboration_ui::item(space, id),
-                        Err(error) => {
-                            self.notice(ctx, "File unavailable", &error.to_string());
-                            return;
-                        }
-                    },
-                };
-                browser::show(ctx, &self.theme, detail);
-                self.show_pdf(ctx, source, &bytes, page);
-            }
-            Err(error) => self.notice(ctx, "Preview unavailable", &error.to_string()),
+            },
+            Err(error) => self.notice(ctx, "File unavailable", &error),
         }
     }
 }
@@ -507,71 +365,6 @@ fn load_file(air: &Air, source: FileSource) -> Result<(Entry, Vec<u8>), String> 
     }
 }
 
-fn page_selection(source: FileSource, page: usize) -> chk::FormComplete {
-    chk::FormComplete::Return(Box::new(move |ctx: &mut Context, _: &Theme| {
-        ctx.emit(source.pdf_event(page));
-    }))
-}
-
-pub(crate) fn pdf_pages(id: EntryId, page: usize, count: usize, theme: &Theme) -> chk::Flow {
-    pdf_pages_for(FileSource::Private(id), page, count, theme)
-}
-
-fn pdf_pages_for(source: FileSource, page: usize, count: usize, theme: &Theme) -> chk::Flow {
-    use chk::{Action, Form, FormAction, FormItem, FormValidState, Icons, State};
-    let mut actions = Vec::new();
-    if page > 0 {
-        actions.push(FormAction::Custom(
-            "Previous page".into(),
-            None,
-            Icons::Back,
-            Action::custom(move |ctx: &mut Context, theme: &Theme| {
-                page_selection(source, page - 1).run(ctx, theme)
-            }),
-        ));
-    }
-    if page + 1 < count {
-        actions.push(FormAction::Custom(
-            "Next page".into(),
-            None,
-            Icons::Forward,
-            Action::custom(move |ctx: &mut Context, theme: &Theme| {
-                page_selection(source, page + 1).run(ctx, theme)
-            }),
-        ));
-    }
-    chk::Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::text_with_preset(
-            &format!("Page {} of {count}", page + 1),
-            &(page + 1).to_string(),
-            Some(actions),
-            move |_: &mut Context, text: String| match parse_page(&text, count) {
-                Some(_) => FormValidState::Valid,
-                None => FormValidState::InvalidWithData(format!("Enter a page from 1 to {count}.")),
-            },
-        )],
-        None,
-        None,
-        Box::new(move |_: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(text)) = states.first() else {
-                return chk::FormComplete::None;
-            };
-            parse_page(text, count)
-                .map(|page| page_selection(source, page))
-                .unwrap_or(chk::FormComplete::None)
-        }),
-    ))
-}
-
-fn parse_page(text: &str, count: usize) -> Option<usize> {
-    text.trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|page| *page > 0 && *page <= count)
-        .map(|page| page - 1)
-}
-
 #[on_event]
 impl OnEvent<FileEvent> for FileRuntime {
     fn on(&mut self, ctx: &mut Context, event: FileEvent) -> Vec<Box<dyn DynEvent>> {
@@ -582,18 +375,10 @@ impl OnEvent<FileEvent> for FileRuntime {
                     self.picker = Some(ctx.hardware.pick::<Vec<PathBuf>>());
                 }
             }
-            FileEvent::Preview(id) => self.open_file(ctx, FileSource::Private(id), true),
-            FileEvent::PdfPage(id, page) => self.open_pdf_page(ctx, FileSource::Private(id), page),
-            FileEvent::Export(id) => self.open_file(ctx, FileSource::Private(id), false),
+            FileEvent::Export(id) => self.export_file(ctx, FileSource::Private(id)),
             FileEvent::SharedImport(space, parent) => self.pick_shared_import(ctx, space, parent),
-            FileEvent::SharedPreview(space, id) => {
-                self.open_file(ctx, FileSource::Shared(space, id), true)
-            }
-            FileEvent::SharedPdfPage(space, id, page) => {
-                self.open_pdf_page(ctx, FileSource::Shared(space, id), page)
-            }
             FileEvent::SharedExport(space, id) => {
-                self.open_file(ctx, FileSource::Shared(space, id), false)
+                self.export_file(ctx, FileSource::Shared(space, id))
             }
             FileEvent::SharedReplace(space, id) => self.pick_shared_replacement(ctx, space, id),
             FileEvent::SharedExportConflict(space, id, conflict) => {
@@ -626,21 +411,6 @@ impl OnChange<PickResult<Vec<PathBuf>>> for FileRuntime {
             }
         }
     }
-}
-
-/// Reject folders, non-UTF8 names and oversized files before allocating their contents.
-fn safe_image_dimensions(bytes: &[u8]) -> bool {
-    chk::image::io::Reader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()
-        .and_then(|reader| reader.into_dimensions().ok())
-        .is_some_and(|(width, height)| {
-            width > 0
-                && height > 0
-                && width <= 8192
-                && height <= 8192
-                && u64::from(width) * u64::from(height) <= 16_000_000
-        })
 }
 
 fn read_import(path: &Path) -> Result<Vec<u8>, String> {
@@ -707,39 +477,6 @@ fn write_export(name: &str, bytes: &[u8]) -> Result<PathBuf, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pdf_page_numbers_are_one_based_and_bounded() {
-        assert_eq!(parse_page("1", 3), Some(0));
-        assert_eq!(parse_page(" 3 ", 3), Some(2));
-        for input in [
-            "",
-            "0",
-            "4",
-            "-1",
-            "1.5",
-            "page 2",
-            "999999999999999999999999999",
-        ] {
-            assert_eq!(parse_page(input, 3), None, "{input}");
-        }
-        assert_eq!(parse_page("1", 0), None);
-    }
-
-    #[test]
-    fn pdf_navigation_keeps_shared_space_and_file_scope() {
-        let space = Id::random();
-        let entry = Id::random();
-        assert!(matches!(
-            FileSource::Private(entry).pdf_event(2),
-            FileEvent::PdfPage(actual, 2) if actual == entry
-        ));
-        assert!(matches!(
-            FileSource::Shared(space, entry).pdf_event(4),
-            FileEvent::SharedPdfPage(actual_space, actual_entry, 4)
-                if actual_space == space && actual_entry == entry
-        ));
-    }
 
     #[test]
     fn replacement_reads_one_file_without_adopting_its_name() {
