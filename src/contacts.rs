@@ -1,4 +1,4 @@
-//! Fig Files' private address book. Adding a contact records a receiving name;
+//! Fig Files' private address book. Adding a contact records an AirName;
 //! it does not send an invitation or share any AIR channel with that person.
 use prism::air::{Air, Contract, Id, Instance, Metadata, Name};
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ impl fmt::Display for ContactError {
         f.write_str(match self {
             Self::Unauthorized => "This address book belongs to another identity.",
             Self::OwnName => "You cannot add yourself as a contact.",
-            Self::InvalidName => "Paste a complete Fig Files receiving name, or scan its QR code.",
+            Self::InvalidName => "Enter a valid AirName.",
         })
     }
 }

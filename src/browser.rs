@@ -3,9 +3,9 @@ use crate::collaboration::SharedSpace;
 use crate::runtime::FileEvent;
 use crate::storage::{self, Entry, EntryId, EntryKind, Vault};
 use chk::{
-    Action, AvatarContent, AvatarIconStyle, Bumper, Context, Display, Flow, FlowBuilder, Form,
-    FormComplete, FormItem, FormValidState, Icons, ListItem, Offset, Page, PageType, State,
-    TableItem, Theme, Watch,
+    Action, ActionItem, AvatarContent, AvatarIconStyle, Bumper, Context, Display, Flow, Form, FormComplete,
+    FormItem, FormValidState, FormValues, Icons, ListItem, Offset, Page, PageType, State, Theme,
+    ValueItem, ContractWatch, ListWatch,
 };
 use prism::air::Instance;
 
@@ -36,7 +36,7 @@ fn file_action(event: FileEvent) -> Action {
 
 pub fn listing(vault: Instance<Vault>, location: Location, root: bool) -> Page {
     Page::watching(
-        (Watch::contract(vault), Watch::list::<SharedSpace>()),
+        (ContractWatch::new(vault), ListWatch::<SharedSpace>::default()),
         move |_ctx: &mut Context,
               theme: &Theme,
               (vault, spaces): (Instance<Vault>, Vec<Instance<SharedSpace>>)| {
@@ -85,7 +85,7 @@ pub fn listing(vault: Instance<Vault>, location: Location, root: bool) -> Page {
                 }
             }
             let title = match &location {
-                Location::Folder(None) => "Fig Files".into(),
+                Location::Folder(None) => "Files".into(),
                 Location::Folder(Some(id)) => snapshot
                     .get(*id)
                     .map(|e| e.name.clone())
@@ -93,7 +93,7 @@ pub fn listing(vault: Instance<Vault>, location: Location, root: bool) -> Page {
                 Location::Trash => "Trash".into(),
                 Location::Search(query) => format!("Results for “{query}”"),
             };
-            let entries = library_entries(&snapshot, &spaces, &location);
+            let entries = library_entries(&snapshot, &spaces, &location, None);
             let (count, total) = library_totals(&snapshot, &spaces);
             let trail = if let Location::Folder(Some(_)) = location {
                 let names: Vec<_> = snapshot
@@ -102,8 +102,6 @@ pub fn listing(vault: Instance<Vault>, location: Location, root: bool) -> Page {
                     .map(|e| e.name)
                     .collect();
                 Some(format!("Files / {}", names.join(" / ")))
-            } else if matches!(location, Location::Trash) {
-                Some("Restore items here, or remove them from your library.".into())
             } else {
                 None
             };
@@ -116,116 +114,50 @@ pub fn listing(vault: Instance<Vault>, location: Location, root: bool) -> Page {
                 let search_vault = vault.clone();
                 Some((
                     Icons::Search,
-                    Box::new(move |_: &mut Context, theme: &Theme| {
-                        search_flow(search_vault.clone(), theme)
-                    }) as Box<dyn FlowBuilder>,
+                    Action::flow(search_flow(search_vault.clone(), parent, theme)),
                 ))
             } else {
                 None
             };
-            if entries.is_empty() {
-                let (art, label, hint) = match location {
-                    Location::Trash => (
-                        "brand/empty-trash",
-                        "All clear",
-                        "Files you move to Trash will appear here.",
-                    ),
-                    Location::Search(_) => (
-                        "brand/empty-files",
-                        "No matching files",
-                        "Try another file or folder name.",
-                    ),
-                    _ => (
-                        "brand/empty-files",
-                        "Room for your next idea",
-                        "Import your first file or create a folder. Files up to 8 MiB are supported.",
-                    ),
+            if entries.is_empty() && matches!(location, Location::Trash) {
+                displays.push(Display::list(None, vec![], Some("Trash is empty.")));
+            } else if entries.is_empty() && matches!(location, Location::Folder(_)) {
+                let message = if parent.is_some() {
+                    "This folder is empty."
+                } else {
+                    "No files yet."
                 };
-                displays.extend([
-                    Display::image(art, (160.0, 160.0)),
-                    Display::label(label),
-                    Display::instructions(hint),
-                ]);
+                displays.push(Display::list(None, vec![], Some(message)));
+            } else if entries.is_empty() {
+                displays.push(Display::list(None, vec![], Some("No matching files or folders.")));
             } else {
                 let rows = entries
                     .into_iter()
-                    .map(|(entry, shared)| {
-                        let page = if let Some(space) = shared {
-                            if let Some(instance) =
-                                spaces.iter().find(|instance| instance.id() == space)
-                            {
-                                crate::collaboration_ui::item(instance.clone(), entry.id)
-                            } else {
-                                crate::collaboration_ui::mount(space)
-                            }
-                        } else if let EntryKind::Shared { space, .. } = entry.kind {
-                            if matches!(location, Location::Trash) {
-                                detail(vault.clone(), entry.id)
-                            } else {
-                                crate::collaboration_ui::mount(space)
-                            }
-                        } else if entry.is_folder() && !matches!(location, Location::Trash) {
-                            listing(vault.clone(), Location::Folder(Some(entry.id)), false)
-                        } else {
-                            detail(vault.clone(), entry.id)
-                        };
-                        let subtitle =
-                            if shared.is_some() || matches!(entry.kind, EntryKind::Shared { .. }) {
-                                if entry.is_folder() {
-                                    "Shared folder · Can edit".into()
-                                } else {
-                                    "Shared file · Can edit".into()
-                                }
-                            } else if entry.is_folder() {
-                                "Folder".into()
-                            } else {
-                                format!("{} · {}", file_kind(&entry), format_size(entry.size()))
-                            };
-                        ListItem::avatar(
-                            theme
-                                .brand()
-                                .images
-                                .get(entry_art(&entry))
-                                .cloned()
-                                .map(AvatarContent::image)
-                                .unwrap_or_else(|| {
-                                    AvatarContent::icon(entry_icon(&entry), AvatarIconStyle::Brand)
-                                }),
-                            &entry.name,
-                            &subtitle,
-                            None,
-                            Some(Flow::new(vec![page])),
-                        )
-                    })
+                    .map(|(entry, shared)| library_row(vault.clone(), &spaces, &location, entry, shared, theme))
                     .collect();
                 displays.push(Display::list(None, rows, None));
             }
             if let Some(id) = parent {
-                displays.push(Display::list(
-                    None,
-                    vec![ListItem::plain(
-                        "Folder details",
-                        "Share and manage this folder",
-                        None,
-                        Some(Flow::new(vec![detail(vault.clone(), id)])),
+                displays.push(Display::cta(
+                    "Folder details", None, "Share and manage this folder",
+                    vec![ActionItem::new(
+                        Action::flow(Flow::new(vec![detail(vault.clone(), id)])),
+                        "Folder details", Icons::Info,
                     )],
-                    None,
                 ));
             }
-            displays.push(Display::instructions(&format!(
-                "{count} {} · {} in your library",
-                if count == 1 { "item" } else { "items" },
-                format_size(total),
-            )));
+            // displays.push(Display::instructions(&format!(
+            //     "{count} {} · {} in your library",
+            //     if count == 1 { "item" } else { "items" },
+            //     format_size(total),
+            // )));
             let can_add = matches!(location, Location::Folder(_));
             if root {
                 let add = can_add.then(|| {
                     let vault = vault.clone();
                     (
                         "Add files".into(),
-                        Box::new(move |_: &mut Context, theme: &Theme| {
-                            Flow::new(vec![add_page(vault.clone(), parent, theme)])
-                        }) as Box<dyn FlowBuilder>,
+                        Action::flow(Flow::new(vec![add_page(vault.clone(), parent, theme)])),
                     )
                 });
                 PageType::root(&title, vec![], displays, header, add, None)
@@ -255,7 +187,7 @@ pub fn detail(vault: Instance<Vault>, id: EntryId) -> Page {
 
 pub(crate) fn info(vault: Instance<Vault>, id: EntryId) -> Page {
     Page::watching(
-        Watch::contract(vault),
+        ContractWatch::new(vault),
         move |ctx: &mut Context, theme: &Theme, vault: Instance<Vault>| {
             let snapshot = vault.pending();
             let Some(entry) = snapshot.get(id).cloned() else {
@@ -306,9 +238,9 @@ pub(crate) fn info(vault: Instance<Vault>, id: EntryId) -> Page {
             };
             drop(snapshot);
             let mut metadata = vec![
-                TableItem::new("Kind", &file_kind(&entry)),
-                TableItem::new("Size", &size),
-                TableItem::new(
+                ValueItem::new("Kind", &file_kind(&entry)),
+                ValueItem::new("Size", &size),
+                ValueItem::new(
                     "Location",
                     &format!(
                         "Files{}",
@@ -321,14 +253,14 @@ pub(crate) fn info(vault: Instance<Vault>, id: EntryId) -> Page {
                 ),
             ];
             if !entry.is_folder() && !trashed {
-                metadata.insert(0, TableItem::new("Name", &entry.name));
-                metadata.push(TableItem::new("Access", "Only you"));
+                metadata.insert(0, ValueItem::new("Name", &entry.name));
+                metadata.push(ValueItem::new("Access", "Only you"));
             }
             let mut displays = if !entry.is_folder() && !trashed {
                 vec![Display::table("Details", metadata, None)]
             } else {
                 vec![
-                    Display::image(entry_art(&entry), (112.0, 112.0)),
+                    Display::image(entry_art(&entry), 112.0),
                     Display::label(&entry.name),
                     Display::table("Details", metadata, None),
                 ]
@@ -339,9 +271,9 @@ pub(crate) fn info(vault: Instance<Vault>, id: EntryId) -> Page {
                 (
                     Some((
                         Icons::Delete,
-                        Box::new(move |_: &mut Context, _: &Theme| {
+                        Action::flow({
                             Flow::new(vec![confirmation(delete_vault.clone(), id, true)])
-                        }) as Box<dyn FlowBuilder>,
+                        }),
                     )),
                     Bumper::custom(
                         "Restore",
@@ -358,55 +290,74 @@ pub(crate) fn info(vault: Instance<Vault>, id: EntryId) -> Page {
                     ),
                 )
             } else if entry.is_folder() {
-                let manage_vault = vault.clone();
                 let share_vault = vault.clone();
+                displays.extend([
+                    Display::cta(
+                        "Share", None, "Give read and write access to this folder",
+                        vec![ActionItem::new(
+                            Action::deferred_flow(move |ctx: &mut Context, theme: &Theme| {
+                                crate::sharing_ui::send_flow(ctx, share_vault.clone(), id, theme)
+                            }),
+                            "Share", Icons::Send,
+                        )],
+                    ),
+                    Display::cta(
+                        "Move", None, "Choose another folder",
+                        vec![ActionItem::new(
+                            Action::flow(move_flow(vault.clone(), id, theme)),
+                            "Move", Icons::Forward,
+                        )],
+                    ),
+                    Display::cta(
+                        "Delete", None, "Move this folder and its contents to Trash",
+                        vec![ActionItem::new(
+                            Action::flow(Flow::new(vec![confirmation(vault.clone(), id, false)])),
+                            "Delete", Icons::Delete,
+                        )],
+                    ),
+                ]);
                 (
                     Some((
-                        Icons::Settings,
-                        Box::new(move |_: &mut Context, _: &Theme| {
-                            Flow::new(vec![manage_page(manage_vault.clone(), id)])
-                        }) as Box<dyn FlowBuilder>,
+                        Icons::Edit,
+                        Action::flow(rename_flow(vault.clone(), id, theme)),
                     )),
-                    Bumper::custom(
-                        "Share folder",
-                        Action::custom(move |ctx: &mut Context, theme: &Theme| {
-                            crate::sharing_ui::send_flow(ctx, share_vault.clone(), id, theme)
-                                .build(ctx, theme)(ctx, theme);
-                        }),
-                    ),
+                    Bumper::None,
                 )
             } else {
-                displays.push(Display::list(
-                    None,
-                    vec![
-                        ListItem::plain(
-                            "Share",
-                            "Give contacts read and write access",
-                            None,
-                            Some(crate::sharing_ui::send_flow(ctx, vault.clone(), id, theme)),
-                        ),
-                        ListItem::plain(
-                            "Delete",
-                            "Move this file to Trash",
-                            None,
-                            Some(Flow::new(vec![confirmation(vault.clone(), id, false)])),
-                        ),
-                        ListItem::plain(
-                            "Manage file",
-                            "Rename or move",
-                            None,
-                            Some(Flow::new(vec![manage_page(vault.clone(), id)])),
-                        ),
-                        ListItem::plain(
-                            "Export file",
-                            "Open a local copy in another app",
-                            None,
-                            Some(Flow::new(vec![export_page(id)])),
-                        ),
-                    ],
-                    None,
-                ));
-                (None, Bumper::None)
+                displays.extend([
+                    Display::cta(
+                        "Share", None, "Give contacts read and write access",
+                        vec![ActionItem::new(
+                            Action::flow(crate::sharing_ui::send_flow(ctx, vault.clone(), id, theme)),
+                            "Share", Icons::Send,
+                        )],
+                    ),
+                    Display::cta(
+                        "Move", None, "Choose another folder",
+                        vec![ActionItem::new(
+                            Action::flow(move_flow(vault.clone(), id, theme)),
+                            "Move", Icons::Forward,
+                        )],
+                    ),
+                    Display::cta(
+                        "Delete", None, "Move this file to Trash",
+                        vec![ActionItem::new(
+                            Action::flow(Flow::new(vec![confirmation(vault.clone(), id, false)])),
+                            "Delete", Icons::Delete,
+                        )],
+                    ),
+                    Display::cta(
+                        "Export file", None, "Open a local copy in another app",
+                        vec![ActionItem::new(
+                            Action::flow(Flow::new(vec![export_page(id)])),
+                            "Export file", Icons::Forward,
+                        )],
+                    ),
+                ]);
+                (
+                    Some((Icons::Edit, Action::flow(rename_flow(vault.clone(), id, theme)))),
+                    Bumper::None,
+                )
             };
             PageType::display(&entry.name, displays, header, bumper, Offset::Start)
         },
@@ -435,90 +386,18 @@ pub(crate) fn add_page(vault: Instance<Vault>, parent: Option<EntryId>, theme: &
         &format!("Add to {destination}"),
         vec![
             Display::instructions("Choose files from your device. Each file can be up to 8 MiB."),
-            Display::list(
-                None,
-                vec![ListItem::plain(
-                    "New folder",
-                    "Create a folder here",
-                    None,
-                    Some(create_folder_flow(vault, parent, theme)),
+            Display::cta(
+                "New folder", None, "Create a folder here",
+                vec![ActionItem::new(
+                    Action::flow(create_folder_flow(vault, parent, theme)),
+                    "New folder", Icons::Add,
                 )],
-                None,
             ),
         ],
         None,
         Bumper::custom("Import files", file_action(FileEvent::Import(parent))),
         Offset::Start,
     )))
-}
-
-pub(crate) fn manage_page(vault: Instance<Vault>, id: EntryId) -> Page {
-    Page::watching(
-        Watch::contract(vault),
-        move |_: &mut Context, theme: &Theme, vault: Instance<Vault>| {
-            let snapshot = vault.pending();
-            let Some(entry) = snapshot.get(id).filter(|_| !snapshot.is_trashed(id)) else {
-                return PageType::display(
-                    "Item unavailable",
-                    vec![Display::instructions(
-                        "This item was removed or moved to Trash.",
-                    )],
-                    None,
-                    Bumper::Done,
-                    Offset::Start,
-                );
-            };
-            if let EntryKind::Shared { space, .. } = entry.kind {
-                return PageType::display(
-                    "Manage shared item",
-                    vec![Display::instructions(
-                        "Changes to shared items apply to everyone.",
-                    )],
-                    None,
-                    Bumper::custom(
-                        "Open shared item",
-                        Action::flow(Flow::new(vec![crate::collaboration_ui::mount(space)])),
-                    ),
-                    Offset::Start,
-                );
-            }
-            let name = entry.name.clone();
-            drop(snapshot);
-            let delete_vault = vault.clone();
-            PageType::display(
-                "Manage",
-                vec![
-                    Display::label(&name),
-                    Display::list(
-                        None,
-                        vec![
-                            ListItem::plain(
-                                "Rename",
-                                "Change the name",
-                                None,
-                                Some(rename_flow(vault.clone(), id, theme)),
-                            ),
-                            ListItem::plain(
-                                "Move",
-                                "Choose another folder",
-                                None,
-                                Some(move_flow(vault.clone(), id, theme)),
-                            ),
-                        ],
-                        None,
-                    ),
-                ],
-                Some((
-                    Icons::Delete,
-                    Box::new(move |_: &mut Context, _: &Theme| {
-                        Flow::new(vec![confirmation(delete_vault.clone(), id, false)])
-                    }) as Box<dyn FlowBuilder>,
-                )),
-                Bumper::None,
-                Offset::Start,
-            )
-        },
-    )
 }
 
 fn validation(name: String) -> FormValidState {
@@ -528,19 +407,20 @@ fn validation(name: String) -> FormValidState {
     }
 }
 
-fn create_folder_flow(vault: Instance<Vault>, parent: Option<EntryId>, theme: &Theme) -> Flow {
+fn create_folder_flow(vault: Instance<Vault>, parent: Option<EntryId>, _theme: &Theme) -> Flow {
     Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::text(
-            "New folder",
-            "folder name",
-            None,
-            |_: &mut Context, name: String| validation(name),
-        )],
+        vec![
+            FormItem::text(
+                "name", uuid::Uuid::new_v4(), "New folder",
+                "folder name",
+                None,
+                |_: &mut Context, name: String| validation(name),
+            ),
+        ],
         None,
         None,
-        Box::new(move |_: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(name)) = states.first() else {
+        Box::new(move |_: &mut Context, states: &FormValues| {
+            let Some(State::Text(name)) = states.get("name") else {
                 return FormComplete::None;
             };
             match storage::create_folder(&mut vault.clone(), parent, name) {
@@ -564,35 +444,33 @@ fn create_folder_flow(vault: Instance<Vault>, parent: Option<EntryId>, theme: &T
     ))
 }
 
-fn rename_flow(vault: Instance<Vault>, id: EntryId, theme: &Theme) -> Flow {
-    let name = vault
-        .pending()
-        .get(id)
-        .map(|e| e.name.clone())
+fn rename_flow(vault: Instance<Vault>, id: EntryId, _theme: &Theme) -> Flow {
+    let (name, folder) = vault.pending().get(id)
+        .map(|entry| (entry.name.clone(), entry.is_folder()))
         .unwrap_or_default();
-    Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::text_with_preset(
-            "Rename",
-            &name,
-            None,
-            |_: &mut Context, name: String| validation(name),
-        )],
-        None,
-        None,
-        Box::new(move |_: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(name)) = states.first() else {
+    Flow::from_form(Form::page(
+        if folder { "Edit folder" } else { "Edit file" },
+        vec![
+            FormItem::text_with_preset(
+                "name", uuid::Uuid::new_v4(),
+                if folder { "Folder name" } else { "File name" },
+                &name, None, |_: &mut Context, name: String| validation(name),
+            ),
+        ],
+        vec![],
+        Box::new(move |_: &mut Context, states: &FormValues| {
+            let Some(State::Text(name)) = states.get("name") else {
                 return FormComplete::None;
             };
             match storage::rename(&mut vault.clone(), id, name) {
-                Ok(_) => FormComplete::Return(Box::new(|_: &mut Context, _: &Theme| {})),
-                Err(error) => FormComplete::Next(message("Could not rename", &error.to_string())),
+                Ok(_) => FormComplete::None,
+                Err(error) => FormComplete::Error(error.to_string()),
             }
         }),
     ))
 }
 
-pub(crate) fn move_flow(vault: Instance<Vault>, id: EntryId, theme: &Theme) -> Flow {
+pub(crate) fn move_flow(vault: Instance<Vault>, id: EntryId, _theme: &Theme) -> Flow {
     let snapshot = vault.pending();
     let current_parent = snapshot.get(id).and_then(|e| e.parent);
     let folders: Vec<_> = snapshot
@@ -630,14 +508,13 @@ pub(crate) fn move_flow(vault: Instance<Vault>, id: EntryId, theme: &Theme) -> F
         .iter()
         .map(|(_, label)| (label.as_str(), "Folder"))
         .collect();
-    let input = FormItem::enumerator("Move to folder", choices);
+    let input = FormItem::enumerator("destination", "Move to folder", choices);
     Flow::from_form(Form::flow(
-        theme,
         vec![input],
         None,
         None,
-        Box::new(move |_: &mut Context, states: &Vec<State>| {
-            let Some(State::Enumerator(index)) = states.first() else {
+        Box::new(move |_: &mut Context, states: &FormValues| {
+            let Some(State::Enumerator(index)) = states.get("destination") else {
                 return FormComplete::None;
             };
             let Some((parent, _)) = destinations.get(*index) else {
@@ -651,34 +528,41 @@ pub(crate) fn move_flow(vault: Instance<Vault>, id: EntryId, theme: &Theme) -> F
     ))
 }
 
-fn search_flow(vault: Instance<Vault>, theme: &Theme) -> Flow {
-    Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::text(
-            "Search files",
-            "file or folder name",
-            None,
-            |_: &mut Context, query: String| {
-                if query.trim().is_empty() {
-                    FormValidState::Invalid
-                } else {
-                    FormValidState::Valid
+fn search_flow(vault: Instance<Vault>, scope: Option<EntryId>, _theme: &Theme) -> Flow {
+    Flow::new(vec![crate::search::page(
+        if scope.is_some() { "Folder" } else { "Files" },
+        (ContractWatch::new(vault), ListWatch::<SharedSpace>::default()),
+        move |_, theme, (vault, spaces), query| {
+            let snapshot = vault.pending();
+            if let Some(folder) = scope {
+                let Some(entry) = snapshot.get(folder)
+                    .filter(|entry| entry.is_folder() && !snapshot.is_trashed(entry.id))
+                else {
+                    return vec![Display::instructions("This folder is no longer available.")];
+                };
+                if let EntryKind::Shared { space, .. } = entry.kind
+                    && !spaces.iter().any(|instance| {
+                        let state = instance.pending();
+                        instance.id() == space && state.is_ready() && state.can_write(snapshot.owner)
+                    })
+                {
+                    return vec![Display::instructions("This shared folder is syncing or unavailable.")];
                 }
-            },
-        )],
-        None,
-        None,
-        Box::new(move |_: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(query)) = states.first() else {
-                return FormComplete::None;
+            }
+            let location = Location::Search(query.into());
+            let entries = library_entries(&snapshot, &spaces, &location, scope);
+            drop(snapshot);
+            let rows = entries.into_iter()
+                .map(|(entry, shared)| library_row(vault.clone(), &spaces, &location, entry, shared, theme))
+                .collect();
+            let empty = if query.trim().is_empty() {
+                "No files yet."
+            } else {
+                "No matching files or folders."
             };
-            FormComplete::Next(listing(
-                vault.clone(),
-                Location::Search(query.trim().to_string()),
-                false,
-            ))
-        }),
-    ))
+            vec![Display::list(None, rows, Some(empty))]
+        },
+    )])
 }
 
 fn confirmation(vault: Instance<Vault>, id: EntryId, permanent: bool) -> Page {
@@ -793,12 +677,53 @@ pub fn format_size(size: u64) -> String {
     }
 }
 
+fn library_row(
+    vault: Instance<Vault>,
+    spaces: &[Instance<SharedSpace>],
+    location: &Location,
+    entry: Entry,
+    shared: Option<EntryId>,
+    theme: &Theme,
+) -> ListItem {
+    let page = if let Some(space) = shared {
+        if let Some(instance) = spaces.iter().find(|instance| instance.id() == space) {
+            crate::collaboration_ui::item(instance.clone(), entry.id)
+        } else {
+            crate::collaboration_ui::mount(space)
+        }
+    } else if let EntryKind::Shared { space, .. } = entry.kind {
+        if matches!(location, Location::Trash) {
+            detail(vault.clone(), entry.id)
+        } else {
+            crate::collaboration_ui::mount(space)
+        }
+    } else if entry.is_folder() && !matches!(location, Location::Trash) {
+        listing(vault.clone(), Location::Folder(Some(entry.id)), false)
+    } else {
+        detail(vault.clone(), entry.id)
+    };
+    let subtitle = if shared.is_some() || matches!(entry.kind, EntryKind::Shared { .. }) {
+        if entry.is_folder() { "Shared folder · Can edit".into() } else { "Shared file · Can edit".into() }
+    } else if entry.is_folder() {
+        "Folder".into()
+    } else {
+        format!("{} · {}", file_kind(&entry), format_size(entry.size()))
+    };
+    ListItem::avatar(
+        theme.image(entry_art(&entry)).map(AvatarContent::image)
+            .unwrap_or_else(|| AvatarContent::icon(entry_icon(&entry), AvatarIconStyle::Brand)),
+        &entry.name, &subtitle, None,
+        Some(Action::flow(Flow::new(vec![page]))), false, None,
+    )
+}
+
 /// Resolve library links on every shared update, including live shared
 /// descendants in global search.
 fn library_entries(
     vault: &Vault,
     spaces: &[Instance<SharedSpace>],
     location: &Location,
+    search_scope: Option<EntryId>,
 ) -> Vec<(Entry, Option<EntryId>)> {
     let base = match location {
         Location::Folder(parent) => vault.children(*parent),
@@ -806,7 +731,8 @@ fn library_entries(
         Location::Search(_) => vault
             .entries
             .values()
-            .filter(|entry| !vault.is_trashed(entry.id))
+            .filter(|entry| !vault.is_trashed(entry.id)
+                && search_scope.is_none_or(|folder| vault.is_descendant(entry.id, folder)))
             .cloned()
             .collect(),
     };
@@ -832,7 +758,10 @@ fn library_entries(
         for mount in vault
             .entries
             .values()
-            .filter(|entry| !vault.is_trashed(entry.id))
+            // Scope mounts by their personal location before resolving shared IDs.
+            // Include the scope itself if that folder was promoted to shared access.
+            .filter(|entry| !vault.is_trashed(entry.id)
+                && search_scope.is_none_or(|folder| entry.id == folder || vault.is_descendant(entry.id, folder)))
         {
             let EntryKind::Shared { space, .. } = mount.kind else {
                 continue;
@@ -857,7 +786,11 @@ fn library_entries(
     }
     if let Location::Search(query) = location {
         let query = query.to_lowercase();
-        rows.retain(|(entry, _)| entry.name.to_lowercase().contains(&query));
+        let terms = query.split_whitespace().collect::<Vec<_>>();
+        rows.retain(|(entry, _)| {
+            let name = entry.name.to_lowercase();
+            terms.iter().all(|term| name.contains(term))
+        });
     }
     rows.sort_by(|(a, _), (b, _)| {
         b.is_folder()
@@ -895,7 +828,7 @@ fn library_totals(vault: &Vault, spaces: &[Instance<SharedSpace>]) -> (usize, u6
 /// collaborators' shared root or its contents.
 pub(crate) fn shortcut_page(vault: Instance<Vault>, id: EntryId) -> Page {
     Page::watching(
-        Watch::contract(vault),
+        ContractWatch::new(vault),
         move |_: &mut Context, theme: &Theme, vault: Instance<Vault>| {
             let state = vault.pending();
             let Some(entry) = state
@@ -933,31 +866,29 @@ pub(crate) fn shortcut_page(vault: Instance<Vault>, id: EntryId) -> Page {
                     Offset::Start,
                 );
             }
-            let deleting = vault.clone();
             PageType::display(
                 "Files shortcut",
                 vec![
                     Display::label(&name),
                     Display::instructions(
-                        "These settings affect only your shortcut in Files. The shared item remains available to everyone.",
+                        "Changes here affect only your shortcut in Files. The shared item stays available to everyone.",
                     ),
-                    Display::list(
-                        None,
-                        vec![ListItem::plain(
-                            "Move shortcut",
-                            "Choose a folder in your library",
-                            None,
-                            Some(move_flow(vault.clone(), id, theme)),
+                    Display::cta(
+                        "Move", None, "Choose a folder for this shortcut",
+                        vec![ActionItem::new(
+                            Action::flow(move_flow(vault.clone(), id, theme)),
+                            "Move", Icons::Forward,
                         )],
-                        None,
+                    ),
+                    Display::cta(
+                        "Delete", None, "Move this shortcut to Trash; shared contents stay available",
+                        vec![ActionItem::new(
+                            Action::flow(Flow::new(vec![shortcut_delete_confirmation(vault.clone(), id)])),
+                            "Delete", Icons::Delete,
+                        )],
                     ),
                 ],
-                Some((
-                    Icons::Delete,
-                    Box::new(move |_: &mut Context, _: &Theme| {
-                        Flow::new(vec![shortcut_delete_confirmation(deleting.clone(), id)])
-                    }),
-                )),
+                None,
                 Bumper::None,
                 Offset::Start,
             )

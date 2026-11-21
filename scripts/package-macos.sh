@@ -17,23 +17,7 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$iconset" -o "$bundle/Contents/Resources/FigFiles.icns"
 
-cat > "$bundle/Contents/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-    <key>CFBundleName</key><string>Fig Files</string>
-    <key>CFBundleDisplayName</key><string>Fig Files</string>
-    <key>CFBundleIdentifier</key><string>org.ramp.fig-files</string>
-    <key>CFBundleExecutable</key><string>fig-files</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleIconFile</key><string>FigFiles.icns</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
-    <key>NSHighResolutionCapable</key><true/>
-    <key>NSPrincipalClass</key><string>NSApplication</string>
-    <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
-</dict></plist>
-PLIST
+cp macos/Info.plist "$bundle/Contents/Info.plist"
 
-codesign --force --sign - "$bundle"
+codesign --force --sign - --entitlements macos/FigFiles.entitlements "$bundle"
 printf 'Built %s\n' "$bundle"

@@ -1,0 +1,15 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "RYYG6X8WK7.org.ramp.figfiles",
+        "paths": ["/fig-files/invite.html"]
+      },
+      {
+        "appID": "RYYG6X8WK7.org.ramp.fig-files",
+        "paths": ["/fig-files/invite.html"]
+      }
+    ]
+  }
+}

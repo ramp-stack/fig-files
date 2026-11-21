@@ -104,7 +104,7 @@ impl fmt::Display for SharingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => error.fmt(f),
-            Self::OwnName => f.write_str("Enter someone else's Fig Files name."),
+            Self::OwnName => f.write_str("Enter someone else's AirName."),
             Self::Unauthorized => f.write_str("Only the intended recipient can accept or decline this transfer."),
             Self::InvalidSnapshot => f.write_str("This transfer contains an invalid folder tree or filename."),
             Self::TooLarge => f.write_str("Send up to 128 items and 32 MiB total, with files up to 8 MiB and folders up to 32 levels deep."),

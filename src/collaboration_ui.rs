@@ -7,9 +7,9 @@ use crate::{
     storage::{self, Entry, EntryId},
 };
 use chk::{
-    Action, AvatarContent, AvatarIconStyle, Bumper, Context, Display, Flow, FlowBuilder, Form,
-    FormComplete, FormItem, FormValidState, Icons, ListItem, Offset, Page, PageType, State,
-    TableItem, Theme, Watch,
+    Action, ActionItem, AvatarContent, AvatarIconStyle, Bumper, Context, Display, Flow, Form, FormComplete,
+    FormItem, FormValidState, FormValues, Icons, ListItem, Offset, Page, PageType, State, Theme,
+    ValueItem, ContractWatch, ListWatch,
 };
 use prism::air::{Id, Instance};
 
@@ -33,7 +33,7 @@ fn unavailable(body: &str) -> PageType {
 /// to the canonical shared contract, including after a recipient joins.
 pub(crate) fn mount(space: Id) -> Page {
     let fallback = Page::watching(
-        Watch::list::<SharedSpace>(),
+        ListWatch::<SharedSpace>::default(),
         move |ctx: &mut Context, theme: &Theme, spaces: Vec<Instance<SharedSpace>>| {
             let Some(instance) = spaces.into_iter().find(|instance| instance.id() == space) else {
                 return unavailable(
@@ -49,7 +49,7 @@ pub(crate) fn mount(space: Id) -> Page {
 
 pub(crate) fn item(space: Instance<SharedSpace>, id: EntryId) -> Page {
     let fallback = Page::watching(
-        Watch::contract(space.clone()),
+        ContractWatch::new(space.clone()),
         move |ctx: &mut Context, theme: &Theme, space: Instance<SharedSpace>| {
             render_item(ctx, theme, space, id)
         },
@@ -102,10 +102,7 @@ pub(crate) fn render_item(
 fn row(theme: &Theme, entry: &Entry, subtitle: &str, page: Page) -> ListItem {
     ListItem::avatar(
         theme
-            .brand()
-            .images
-            .get(browser::entry_art(entry))
-            .cloned()
+            .image(browser::entry_art(entry))
             .map(AvatarContent::image)
             .unwrap_or_else(|| {
                 AvatarContent::icon(
@@ -120,7 +117,7 @@ fn row(theme: &Theme, entry: &Entry, subtitle: &str, page: Page) -> ListItem {
         &entry.name,
         subtitle,
         None,
-        Some(Flow::new(vec![page])),
+        Some(Action::flow(Flow::new(vec![page]))), false, None,
     )
 }
 
@@ -169,31 +166,22 @@ fn render_folder(
         .collect();
     let mut body = vec![
         Display::text(&path),
-        Display::instructions(
-            "Everyone who joins can read and edit. Changes sync with this shared folder.",
-        ),
-        Display::list(None, rows, Some("This shared folder is empty.")),
-        Display::list(
-            None,
-            vec![ListItem::plain(
-                "Folder details",
-                "Manage this folder",
-                None,
-                Some(Flow::new(vec![details(space.clone(), entry.id)])),
+        Display::list(None, rows, Some("This folder is empty.")),
+        Display::cta(
+            "Folder details", None, "Share and manage this folder",
+            vec![ActionItem::new(
+                Action::flow(Flow::new(vec![details(space.clone(), entry.id)])),
+                "Folder details", Icons::Info,
             )],
-            None,
         ),
     ];
     if entry.id == root {
-        body.push(Display::list(
-            None,
-            vec![ListItem::plain(
-                "Shared Trash",
-                "Restore items removed by collaborators",
-                None,
-                Some(Flow::new(vec![trash_page(space.clone())])),
+        body.push(Display::cta(
+            "Shared Trash", None, "Restore items removed by collaborators",
+            vec![ActionItem::new(
+                Action::flow(Flow::new(vec![trash_page(space.clone())])),
+                "Shared Trash", Icons::Delete,
             )],
-            None,
         ));
     }
     body.push(Display::instructions(&format!(
@@ -207,7 +195,7 @@ fn render_folder(
         body,
         Some((
             Icons::Search,
-            Box::new(move |_: &mut Context, theme: &Theme| search_flow(search.clone(), theme)),
+            Action::flow(search_flow(search.clone(), entry.id, theme)),
         )),
         Bumper::custom(
             "Add files",
@@ -221,7 +209,7 @@ fn render_folder(
 
 pub(crate) fn details(space: Instance<SharedSpace>, id: EntryId) -> Page {
     Page::watching(
-        Watch::contract(space),
+        ContractWatch::new(space),
         move |ctx: &mut Context, theme: &Theme, space: Instance<SharedSpace>| {
             let state = space.pending();
             if state.validate().is_err() || !state.can_write(ctx.air.me()) || !state.is_ready() {
@@ -261,12 +249,18 @@ pub(crate) fn render_detail(
         .join(" / ");
     let root_name = state.title().to_owned();
     let shared_folder = state.is_folder();
+    let can_edit_text = !entry.is_folder()
+        && !trashed
+        && entry.size() <= MAX_EDIT_TEXT as u64
+        && state.read_file(entry.id).is_ok_and(|bytes| {
+            std::str::from_utf8(&bytes).is_ok() && !bytes.contains(&0)
+        });
     drop(state);
     let mut body = if !entry.is_folder() && !trashed {
         Vec::new()
     } else {
         vec![
-            Display::image(browser::entry_art(&entry), (112.0, 112.0)),
+            Display::image(browser::entry_art(&entry), 112.0),
             Display::label(&entry.name),
             Display::instructions(&if entry.is_folder() {
                 "Shared folder · Everyone can edit".into()
@@ -276,15 +270,13 @@ pub(crate) fn render_detail(
         ]
     };
     let conflict_notice = (conflict_count > 0).then(|| {
-        Display::list(
-            None,
-            vec![ListItem::plain(
-                "Edits to review",
-                &format!("{conflict_count} simultaneous edits kept safely"),
-                None,
-                Some(Flow::new(vec![conflicts_page(space.clone(), entry.id)])),
+        Display::cta(
+            "Edits to review", None,
+            &format!("{conflict_count} simultaneous edits kept safely"),
+            vec![ActionItem::new(
+                Action::flow(Flow::new(vec![conflicts_page(space.clone(), entry.id)])),
+                "Edits to review", Icons::Info,
             )],
-            None,
         )
     });
     if (entry.is_folder() || trashed)
@@ -303,7 +295,7 @@ pub(crate) fn render_detail(
             body,
             Some((
                 Icons::Delete,
-                Box::new(move |_: &mut Context, _: &Theme| {
+                Action::flow({
                     Flow::new(vec![delete_confirmation(deleting.clone(), entry.id, true)])
                 }),
             )),
@@ -328,13 +320,16 @@ pub(crate) fn render_detail(
         );
     }
     if !entry.is_folder() {
+        if let Some(notice) = conflict_notice {
+            body.push(notice);
+        }
         body.push(Display::table(
             "Details",
             vec![
-                TableItem::new("Name", &entry.name),
-                TableItem::new("Kind", entry.mime()),
-                TableItem::new("Size", &storage::format_size(entry.size())),
-                TableItem::new(
+                ValueItem::new("Name", &entry.name),
+                ValueItem::new("Kind", entry.mime()),
+                ValueItem::new("Size", &storage::format_size(entry.size())),
+                ValueItem::new(
                     "Location",
                     &if path.is_empty() {
                         "Shared".into()
@@ -342,17 +337,21 @@ pub(crate) fn render_detail(
                         format!("Shared / {path}")
                     },
                 ),
-                TableItem::new("Access", "Read and write for everyone with access"),
+                ValueItem::new("Access", "Read and write for everyone with access"),
             ],
             None,
         ));
-        let (delete_hint, delete) = if entry.id == root {
+        let (move_hint, moving, delete_hint, delete) = if entry.id == root {
             (
+                "Move your Files shortcut",
+                root_move_flow(ctx, space.id(), theme),
                 "Remove your Files shortcut; shared content stays available",
                 root_delete_page(ctx, space.id()),
             )
         } else {
             (
+                "Move within this shared folder",
+                move_flow(space.clone(), entry.id, theme),
                 "Move this file to Shared Trash for everyone",
                 delete_confirmation(space.clone(), entry.id, false),
             )
@@ -362,77 +361,114 @@ pub(crate) fn render_detail(
         } else {
             "Give contacts read and write access to this shared file".into()
         };
-        body.push(Display::list(
-            None,
-            vec![
-                ListItem::plain(
-                    "Share",
-                    &share_hint,
-                    None,
-                    Some(sharing_ui::invite_flow(ctx, space.clone(), theme)),
-                ),
-                ListItem::plain("Delete", delete_hint, None, Some(Flow::new(vec![delete]))),
-                ListItem::plain(
-                    "Manage file",
-                    "Edit, replace, rename or move",
-                    None,
-                    Some(Flow::new(vec![manage_page(space.clone(), entry.id)])),
-                ),
-                ListItem::plain(
-                    "Export file",
-                    "Open a local copy in another app",
-                    None,
-                    Some(Flow::new(vec![export_page(space.clone(), entry.id)])),
-                ),
-                ListItem::plain(
-                    "Access",
-                    "View sharing details and people with access",
-                    None,
-                    Some(Flow::new(vec![sharing_ui::invitation_detail(
-                        space.clone(),
-                    )])),
-                ),
-            ],
-            None,
-        ));
-        if let Some(notice) = conflict_notice {
-            body.push(notice);
+        let mut contents_actions = Vec::new();
+        if can_edit_text {
+            let edit_space = space.clone();
+            let edit_id = entry.id;
+            contents_actions.push(ActionItem::new(
+                Action::deferred_flow(move |_: &mut Context, theme: &Theme| {
+                    edit_text_flow(edit_space.clone(), edit_id, theme)
+                }),
+                "Edit text", Icons::Edit,
+            ));
         }
-        return PageType::display(&entry.name, body, None, Bumper::None, Offset::Start);
+        contents_actions.push(ActionItem::new(
+            Action::flow(Flow::new(vec![replace_page(space.clone(), entry.id)])),
+            "Replace file", Icons::Up,
+        ));
+        body.extend([
+            Display::cta(
+                "Share", None, &share_hint,
+                vec![ActionItem::new(
+                    Action::flow(sharing_ui::invite_flow(ctx, space.clone(), theme)),
+                    "Share", Icons::Send,
+                )],
+            ),
+            Display::cta(
+                "Move", None, move_hint,
+                vec![ActionItem::new(Action::flow(moving), "Move", Icons::Forward)],
+            ),
+            Display::cta(
+                "Delete", None, delete_hint,
+                vec![ActionItem::new(
+                    Action::flow(Flow::new(vec![delete])),
+                    "Delete", Icons::Delete,
+                )],
+            ),
+            Display::cta(
+                "File contents", None, "Changes apply to everyone with access.",
+                contents_actions,
+            ),
+            Display::cta(
+                "Export file", None, "Open a local copy in another app",
+                vec![ActionItem::new(
+                    Action::flow(Flow::new(vec![export_page(space.clone(), entry.id)])),
+                    "Export file", Icons::Forward,
+                )],
+            ),
+        ]);
+        return PageType::display(
+            &entry.name,
+            body,
+            Some((Icons::Edit, Action::flow(name_flow(space, entry.id, false, theme)))),
+            Bumper::None,
+            Offset::Start,
+        );
     }
-    body.push(Display::list(
-        None,
-        vec![ListItem::plain(
-            "Manage folder",
-            "Rename or move",
-            None,
-            Some(Flow::new(vec![manage_page(space.clone(), entry.id)])),
-        )],
-        None,
-    ));
-    let header_space = space.clone();
-    let header: Option<(Icons, Box<dyn FlowBuilder>)> = Some((
-        Icons::Info,
-        Box::new(move |_: &mut Context, _: &Theme| {
-            Flow::new(vec![sharing_ui::invitation_detail(header_space.clone())])
-        }),
-    ));
-    let bumper = if root == entry.id {
-        let sharing = space.clone();
-        Bumper::custom(
-            "Share access",
-            Action::custom(move |ctx: &mut Context, theme: &Theme| {
-                sharing_ui::invite_flow(ctx, sharing.clone(), theme).build(ctx, theme)(ctx, theme);
-            }),
+    let (move_hint, moving, delete_hint, deleting) = if entry.id == root {
+        (
+            "Move your Files shortcut",
+            root_move_flow(ctx, space.id(), theme),
+            "Remove your Files shortcut; shared content stays available",
+            root_delete_page(ctx, space.id()),
         )
     } else {
-        Bumper::None
+        (
+            "Move within this shared folder",
+            move_flow(space.clone(), entry.id, theme),
+            "Move this folder to Shared Trash for everyone",
+            delete_confirmation(space.clone(), entry.id, false),
+        )
     };
-    PageType::display(&entry.name, body, header, bumper, Offset::Start)
+    body.extend([
+        Display::cta(
+            "Share",
+            None,
+            &format!("Share the entire shared folder “{root_name}”, including all files"),
+            vec![ActionItem::new(
+                Action::flow(sharing_ui::invite_flow(ctx, space.clone(), theme)),
+                "Share",
+                Icons::Send,
+            )],
+        ),
+        Display::cta(
+            "Move",
+            None,
+            move_hint,
+            vec![ActionItem::new(Action::flow(moving), "Move", Icons::Forward)],
+        ),
+        Display::cta(
+            "Delete",
+            None,
+            delete_hint,
+            vec![ActionItem::new(
+                Action::flow(Flow::new(vec![deleting])),
+                "Delete",
+                Icons::Delete,
+            )],
+        ),
+    ]);
+    PageType::display(
+        &entry.name,
+        body,
+        Some((Icons::Edit, Action::flow(name_flow(space, entry.id, false, theme)))),
+        Bumper::None,
+        Offset::Start,
+    )
 }
 
-fn root_delete_page(ctx: &Context, space: Id) -> Page {
-    let shortcut = ctx.air.instances::<storage::Vault>().list().into_values().find_map(|vault| {
+fn root_shortcut(ctx: &Context, space: Id) -> Option<(Instance<storage::Vault>, EntryId)> {
+    ctx.air.instances::<storage::Vault>().list().into_values().find_map(|vault| {
         let state = vault.pending();
         if state.owner != ctx.air.me() { return None; }
         let id = state.entries.values().find(|entry| {
@@ -441,14 +477,28 @@ fn root_delete_page(ctx: &Context, space: Id) -> Page {
         }).map(|entry| entry.id);
         drop(state);
         id.map(|id| (vault, id))
-    });
-    if let Some((vault, id)) = shortcut {
+    })
+}
+
+fn root_move_flow(ctx: &Context, space: Id, theme: &Theme) -> Flow {
+    if let Some((vault, id)) = root_shortcut(ctx, space) {
+        browser::move_flow(vault, id, theme)
+    } else {
+        Flow::new(vec![browser::message(
+            "No Files shortcut",
+            "Add this shared item to Files before moving its shortcut.",
+        )])
+    }
+}
+
+fn root_delete_page(ctx: &Context, space: Id) -> Page {
+    if let Some((vault, id)) = root_shortcut(ctx, space) {
         browser::shortcut_delete_confirmation(vault, id)
     } else {
         Page::Static(Box::new(PageType::display(
-            "Shared file",
+            "Shared item",
             vec![Display::instructions(
-                "This shared file has no shortcut in your Files. The shared root cannot be deleted here and remains available to everyone with access.",
+                "This shared item has no shortcut in your Files. The shared root cannot be deleted here and remains available to everyone with access.",
             )],
             None,
             Bumper::None,
@@ -464,15 +514,12 @@ pub(crate) fn add_page(space: Instance<SharedSpace>, parent: EntryId, theme: &Th
             Display::instructions(
                 "New files and folders are available to everyone with access. Files can be up to 8 MiB each.",
             ),
-            Display::list(
-                None,
-                vec![ListItem::plain(
-                    "New folder",
-                    "Create a shared folder here",
-                    None,
-                    Some(name_flow(space.clone(), parent, true, theme)),
+            Display::cta(
+                "New folder", None, "Create a shared folder here",
+                vec![ActionItem::new(
+                    Action::flow(name_flow(space.clone(), parent, true, theme)),
+                    "New folder", Icons::Add,
                 )],
-                None,
             ),
         ],
         None,
@@ -482,92 +529,6 @@ pub(crate) fn add_page(space: Instance<SharedSpace>, parent: EntryId, theme: &Th
         ),
         Offset::Start,
     )))
-}
-
-pub(crate) fn manage_page(space: Instance<SharedSpace>, id: EntryId) -> Page {
-    Page::watching(
-        Watch::contract(space),
-        move |ctx: &mut Context, theme: &Theme, space: Instance<SharedSpace>| {
-            let state = space.pending();
-            if state.validate().is_err()
-                || !state.can_write(ctx.air.me())
-                || state.tree.is_trashed(id)
-            {
-                return unavailable(
-                    "This item is unavailable. Restore it from Shared Trash first.",
-                );
-            }
-            let Some(entry) = state.tree.get(id).cloned() else {
-                return unavailable("This item was removed.");
-            };
-            let root = state.root;
-            let text = state
-                .read_file(id)
-                .ok()
-                .filter(|bytes| bytes.len() <= MAX_EDIT_TEXT)
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .filter(|text| !text.contains('\0'));
-            drop(state);
-            let mut rows = Vec::new();
-            if !entry.is_folder() {
-                if text.is_some() {
-                    rows.push(ListItem::plain(
-                        "Edit text",
-                        "Save changes for everyone",
-                        None,
-                        Some(edit_text_flow(space.clone(), id, theme)),
-                    ));
-                }
-                rows.push(ListItem::plain(
-                    "Replace file",
-                    "Upload an updated version for everyone",
-                    None,
-                    Some(Flow::new(vec![replace_page(space.clone(), id)])),
-                ));
-                rows.push(ListItem::plain(
-                    "Export file",
-                    "Open a local copy in another app",
-                    None,
-                    Some(Flow::new(vec![export_page(space.clone(), id)])),
-                ));
-            }
-            rows.push(ListItem::plain(
-                "Rename",
-                "Change the name for everyone",
-                None,
-                Some(name_flow(space.clone(), id, false, theme)),
-            ));
-            if id != root {
-                rows.push(ListItem::plain(
-                    "Move",
-                    "Move within this shared folder",
-                    None,
-                    Some(move_flow(space.clone(), id, theme)),
-                ));
-            }
-            let deleting = space.clone();
-            // Root access must remain reachable; root removal is deliberately absent.
-            let header = (id != root).then(|| {
-                (
-                    Icons::Delete,
-                    Box::new(move |_: &mut Context, _: &Theme| {
-                        Flow::new(vec![delete_confirmation(deleting.clone(), id, false)])
-                    }) as Box<dyn FlowBuilder>,
-                )
-            });
-            PageType::display(
-                "Manage shared item",
-                vec![
-                    Display::label(&entry.name),
-                    Display::instructions("Changes apply to everyone with access."),
-                    Display::list(None, rows, None),
-                ],
-                header,
-                Bumper::None,
-                Offset::Start,
-            )
-        },
-    )
 }
 
 fn export_page(space: Instance<SharedSpace>, id: EntryId) -> Page {
@@ -605,43 +566,47 @@ fn valid_name(name: String) -> FormValidState {
         Err(error) => FormValidState::InvalidWithData(error.to_string()),
     }
 }
-fn name_flow(space: Instance<SharedSpace>, id: EntryId, create: bool, theme: &Theme) -> Flow {
-    let name = space
+fn name_flow(space: Instance<SharedSpace>, id: EntryId, create: bool, _theme: &Theme) -> Flow {
+    let (name, folder) = space
         .pending()
         .tree
         .get(id)
-        .map(|entry| entry.name.clone())
+        .map(|entry| (entry.name.clone(), entry.is_folder()))
         .unwrap_or_default();
-    let field = if create {
-        FormItem::text(
-            "New folder",
+    if !create {
+        return Flow::from_form(Form::page(
+            if folder { "Edit folder" } else { "Edit file" },
+            vec![FormItem::text_with_preset(
+                "name", uuid::Uuid::new_v4(),
+                if folder { "Folder name" } else { "File name" },
+                &name, None, |_: &mut Context, text| valid_name(text),
+            )],
+            vec![Display::instructions("Changes apply to everyone with access.")],
+            Box::new(move |ctx: &mut Context, states: &FormValues| {
+                let Some(State::Text(name)) = states.get("name") else {
+                    return FormComplete::None;
+                };
+                match collaboration::rename(&ctx.air, &mut space.clone(), id, name) {
+                    Ok(_) => FormComplete::None,
+                    Err(error) => FormComplete::Error(error.to_string()),
+                }
+            }),
+        ));
+    }
+    Flow::from_form(Form::flow(
+        vec![FormItem::text(
+            "name", uuid::Uuid::new_v4(), "New folder",
             "folder name",
             None,
             |_: &mut Context, text| valid_name(text),
-        )
-    } else {
-        FormItem::text_with_preset(
-            "Rename for everyone",
-            &name,
-            None,
-            |_: &mut Context, text| valid_name(text),
-        )
-    };
-    Flow::from_form(Form::flow(
-        theme,
-        vec![field],
+        )],
         None,
         None,
-        Box::new(move |ctx: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(name)) = states.first() else {
+        Box::new(move |ctx: &mut Context, states: &FormValues| {
+            let Some(State::Text(name)) = states.get("name") else {
                 return FormComplete::None;
             };
-            let result = if create {
-                collaboration::create_folder(&ctx.air, &mut space.clone(), id, name)
-            } else {
-                collaboration::rename(&ctx.air, &mut space.clone(), id, name)
-            };
-            match result {
+            match collaboration::create_folder(&ctx.air, &mut space.clone(), id, name) {
                 Ok(_) => return_to(space.clone(), id),
                 Err(error) => {
                     FormComplete::Next(browser::message("Could not save", &error.to_string()))
@@ -657,10 +622,9 @@ fn return_to(space: Instance<SharedSpace>, id: EntryId) -> FormComplete {
     }))
 }
 
-/// The complete draft and its base revision are captured once. A watched remote
-/// update cannot reset the user's text or silently overwrite a simultaneous edit.
-pub(crate) fn edit_text_flow(space: Instance<SharedSpace>, id: EntryId, theme: &Theme) -> Flow {
-    let theme = theme.clone();
+/// Remote updates never reset the draft or its base revision. A successful Save
+/// advances that base to this editor's submitted bytes for the next edit.
+pub(crate) fn edit_text_flow(space: Instance<SharedSpace>, id: EntryId, _theme: &Theme) -> Flow {
     let state = space.pending();
     let draft = state
         .read_file(id)
@@ -670,7 +634,7 @@ pub(crate) fn edit_text_flow(space: Instance<SharedSpace>, id: EntryId, theme: &
         .filter(|text| !text.contains('\0'));
     let expected = state.content_hash(id);
     drop(state);
-    let (Some(draft), Ok(expected)) = (draft, expected) else {
+    let (Some(draft), Ok(mut expected)) = (draft, expected) else {
         return Flow::new(vec![browser::message(
             "Use Replace file",
             "The text editor supports UTF-8 files up to 256 KiB. Export this file to edit it, then use Replace file.",
@@ -678,54 +642,52 @@ pub(crate) fn edit_text_flow(space: Instance<SharedSpace>, id: EntryId, theme: &
     };
     Flow::from_form(Form::page(
         "Edit shared text",
-        vec![FormItem::text_with_preset(
-            "File contents",
-            &draft,
-            None,
-            |_: &mut Context, text: String| {
-                if text.len() <= MAX_EDIT_TEXT && !text.contains('\0') {
-                    FormValidState::Valid
-                } else {
-                    FormValidState::InvalidWithData(
-                        "Use UTF-8 text up to 256 KiB without null bytes.".into(),
-                    )
-                }
-            },
-        )],
+        vec![
+            FormItem::text_with_preset(
+                "content", uuid::Uuid::new_v4(), "File contents",
+                &draft,
+                None,
+                |_: &mut Context, text: String| {
+                    if text.len() <= MAX_EDIT_TEXT && !text.contains('\0') {
+                        FormValidState::Valid
+                    } else {
+                        FormValidState::InvalidWithData(
+                            "Use UTF-8 text up to 256 KiB without null bytes.".into(),
+                        )
+                    }
+                },
+            ),
+        ],
         vec![Display::instructions(
             "Save updates this file for everyone. If someone edits it while you type, both versions are kept under Edits to review.",
         )],
-        Box::new(move |ctx: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(text)) = states.first() else {
+        Box::new(move |ctx: &mut Context, states: &FormValues| {
+            let Some(State::Text(text)) = states.get("content") else {
                 return FormComplete::None;
             };
+            let bytes = text.as_bytes().to_vec();
+            let submitted = Id::hash(&bytes);
             match collaboration::replace_file(
                 &ctx.air,
                 &mut space.clone(),
                 id,
                 expected,
-                text.as_bytes().to_vec(),
+                bytes,
             ) {
-                Ok(ReplaceOutcome::Updated) => return_to(space.clone(), id),
+                Ok(ReplaceOutcome::Updated) => {
+                    expected = submitted;
+                    FormComplete::None
+                }
                 Ok(ReplaceOutcome::SavedConflict(_)) => {
                     FormComplete::Next(conflicts_page(space.clone(), id))
                 }
-                Err(error) => {
-                    // Keep the form/draft alive behind the error. Next would discard it.
-                    let error = error.to_string();
-                    browser::show(
-                        ctx,
-                        &theme,
-                        browser::message("Could not save — draft kept", &error),
-                    );
-                    FormComplete::None
-                }
+                Err(error) => FormComplete::Error(format!("Could not save — draft kept. {error}")),
             }
         }),
     ))
 }
 
-fn move_flow(space: Instance<SharedSpace>, id: EntryId, theme: &Theme) -> Flow {
+fn move_flow(space: Instance<SharedSpace>, id: EntryId, _theme: &Theme) -> Flow {
     let state = space.pending();
     let current = state.tree.get(id).and_then(|entry| entry.parent);
     let choices = state
@@ -754,19 +716,18 @@ fn move_flow(space: Instance<SharedSpace>, id: EntryId, theme: &Theme) -> Flow {
         )]);
     }
     let field = FormItem::enumerator(
-        "Move within shared folder",
+        "destination", "Move within shared folder",
         choices
             .iter()
             .map(|(_, path)| (path.as_str(), "Shared folder"))
             .collect(),
     );
     Flow::from_form(Form::flow(
-        theme,
         vec![field],
         None,
         None,
-        Box::new(move |ctx: &mut Context, states: &Vec<State>| {
-            let Some(State::Enumerator(index)) = states.first() else {
+        Box::new(move |ctx: &mut Context, states: &FormValues| {
+            let Some(State::Enumerator(index)) = states.get("destination") else {
                 return FormComplete::None;
             };
             let Some((parent, _)) = choices.get(*index) else {
@@ -782,63 +743,63 @@ fn move_flow(space: Instance<SharedSpace>, id: EntryId, theme: &Theme) -> Flow {
     ))
 }
 
-fn search_flow(space: Instance<SharedSpace>, theme: &Theme) -> Flow {
-    Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::text(
-            "Search shared folder",
-            "file or folder name",
-            None,
-            |_: &mut Context, text: String| {
-                if text.trim().is_empty() {
-                    FormValidState::Invalid
-                } else {
-                    FormValidState::Valid
-                }
-            },
-        )],
-        None,
-        None,
-        Box::new(move |_: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(query)) = states.first() else {
-                return FormComplete::None;
-            };
-            FormComplete::Next(results_page(space.clone(), query.trim().into()))
-        }),
-    ))
-}
-fn results_page(space: Instance<SharedSpace>, query: String) -> Page {
-    Page::watching(
-        Watch::contract(space),
-        move |ctx: &mut Context, theme: &Theme, space: Instance<SharedSpace>| {
+fn search_flow(space: Instance<SharedSpace>, scope: EntryId, _theme: &Theme) -> Flow {
+    Flow::new(vec![crate::search::page(
+        "Shared folder",
+        ContractWatch::new(space),
+        move |ctx: &mut Context, theme: &Theme, space: Instance<SharedSpace>, query: &str| {
             let state = space.pending();
             if state.validate().is_err() || !state.can_write(ctx.air.me()) {
-                return unavailable("Join the shared folder first.");
+                return vec![Display::instructions("Join the shared folder first.")];
             }
-            let entries = state.tree.search(&query);
+            if state.tree.get(scope).is_none_or(|entry| !entry.is_folder())
+                || state.tree.is_trashed(scope)
+            {
+                return vec![Display::instructions("This folder is no longer available.")];
+            }
+            let terms = query
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>();
+            let mut entries = state
+                .tree
+                .entries
+                .values()
+                .filter(|entry| {
+                    let name = entry.name.to_lowercase();
+                    !state.tree.is_trashed(entry.id)
+                        && state.tree.is_descendant(entry.id, scope)
+                        && terms.iter().all(|term| name.contains(term))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| {
+                b.is_folder()
+                    .cmp(&a.is_folder())
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
             drop(state);
             let rows = entries
                 .iter()
                 .map(|entry| row(theme, entry, "Shared item", item(space.clone(), entry.id)))
                 .collect();
-            PageType::display(
-                &format!("Results for “{query}”"),
-                vec![Display::list(
-                    None,
-                    rows,
-                    Some("No matching files or folders."),
-                )],
+            vec![Display::list(
                 None,
-                Bumper::None,
-                Offset::Start,
-            )
+                rows,
+                Some(if terms.is_empty() {
+                    "No files yet."
+                } else {
+                    "No matching files or folders."
+                }),
+            )]
         },
-    )
+    )])
 }
 
 pub(crate) fn trash_page(space: Instance<SharedSpace>) -> Page {
     Page::watching(
-        Watch::contract(space),
+        ContractWatch::new(space),
         |ctx: &mut Context, theme: &Theme, space: Instance<SharedSpace>| {
             let state = space.pending();
             if state.validate().is_err() || !state.can_write(ctx.air.me()) {
@@ -859,12 +820,7 @@ pub(crate) fn trash_page(space: Instance<SharedSpace>) -> Page {
                 .collect();
             PageType::display(
                 "Shared Trash",
-                vec![
-                    Display::instructions(
-                        "Restore items for everyone, or remove them permanently from this shared folder.",
-                    ),
-                    Display::list(None, rows, Some("Shared Trash is empty.")),
-                ],
+                vec![Display::list(None, rows, Some("Trash is empty."))],
                 None,
                 Bumper::None,
                 Offset::Start,
@@ -914,7 +870,7 @@ fn delete_confirmation(space: Instance<SharedSpace>, id: EntryId, permanent: boo
 
 pub(crate) fn conflicts_page(space: Instance<SharedSpace>, id: EntryId) -> Page {
     Page::watching(
-        Watch::contract(space),
+        ContractWatch::new(space),
         move |ctx: &mut Context, _: &Theme, space: Instance<SharedSpace>| {
             let state = space.pending();
             if state.validate().is_err() || !state.can_write(ctx.air.me()) {
@@ -934,11 +890,11 @@ pub(crate) fn conflicts_page(space: Instance<SharedSpace>, id: EntryId) -> Page 
                             short_name(version.author)
                         ),
                         None,
-                        Some(Flow::new(vec![conflict_page(
+                        Some(Action::flow(Flow::new(vec![conflict_page(
                             space.clone(),
                             id,
                             version.id,
-                        )])),
+                        )]))), false, None,
                     )
                 })
                 .collect();
@@ -963,7 +919,7 @@ fn short_name(name: prism::air::Name) -> String {
 }
 fn conflict_page(space: Instance<SharedSpace>, id: EntryId, version: Id) -> Page {
     Page::watching(
-        Watch::contract(space),
+        ContractWatch::new(space),
         move |ctx: &mut Context, _: &Theme, space: Instance<SharedSpace>| {
             let state = space.pending();
             if state.validate().is_err() || !state.can_write(ctx.air.me()) {
@@ -1038,7 +994,7 @@ fn conflict_page(space: Instance<SharedSpace>, id: EntryId, version: Id) -> Page
                 body,
                 Some((
                     Icons::Delete,
-                    Box::new(move |_: &mut Context, _: &Theme| {
+                    Action::flow({
                         Flow::new(vec![discard_confirmation(discarding.clone(), id, version)])
                     }),
                 )),
@@ -1082,7 +1038,7 @@ fn discard_confirmation(space: Instance<SharedSpace>, id: EntryId, version: Id) 
 
 pub(crate) fn saved_edits() -> Page {
     Page::watching(
-        Watch::list::<crate::drafts::EditDraft>(),
+        ListWatch::<crate::drafts::EditDraft>::default(),
         |ctx: &mut Context, _: &Theme, mut drafts: Vec<Instance<crate::drafts::EditDraft>>| {
             drafts.sort_by_key(|draft| std::cmp::Reverse(draft.pending().created_at));
             let rows = drafts
@@ -1099,7 +1055,7 @@ pub(crate) fn saved_edits() -> Page {
                             storage::format_size(state.bytes.len() as u64)
                         ),
                         None,
-                        Some(Flow::new(vec![saved_edit(draft.clone())])),
+                        Some(Action::flow(Flow::new(vec![saved_edit(draft.clone())]))), false, None,
                     );
                     Some(row)
                 })
@@ -1121,7 +1077,7 @@ pub(crate) fn saved_edits() -> Page {
 }
 pub(crate) fn saved_edit(draft: Instance<crate::drafts::EditDraft>) -> Page {
     Page::watching(
-        (Watch::contract(draft), Watch::list::<SharedSpace>()),
+        (ContractWatch::new(draft), ListWatch::<SharedSpace>::default()),
         |ctx: &mut Context,
          _: &Theme,
          (draft, spaces): (
@@ -1158,15 +1114,12 @@ pub(crate) fn saved_edit(draft: Instance<crate::drafts::EditDraft>) -> Page {
             let bytes = state.bytes.clone();
             let title = state.name.clone();
             if let Some(space) = &space {
-                body.push(Display::list(
-                    None,
-                    vec![ListItem::plain(
-                        "Current shared file",
-                        "Check the latest contents before retrying",
-                        None,
-                        Some(Flow::new(vec![item(space.clone(), file)])),
+                body.push(Display::cta(
+                    "Current shared file", None, "Check the latest contents before retrying",
+                    vec![ActionItem::new(
+                        Action::flow(Flow::new(vec![item(space.clone(), file)])),
+                        "Open file", Icons::Forward,
                     )],
-                    None,
                 ));
                 body.push(Display::instructions("Retry uses the version you originally edited. If the file has changed, your edit is kept under Edits to review."));
             }
@@ -1210,7 +1163,7 @@ pub(crate) fn saved_edit(draft: Instance<crate::drafts::EditDraft>) -> Page {
                 body,
                 Some((
                     Icons::Delete,
-                    Box::new(move |_: &mut Context, _: &Theme| {
+                    Action::flow({
                         let discarding = discarding.clone();
                         Flow::new(vec![Page::Static(Box::new(PageType::display(
                             "Discard private saved edit",

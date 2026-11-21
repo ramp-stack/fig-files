@@ -7,12 +7,13 @@ description = "Native AIR-backed file manager built with CHK, with shared read/w
 repository = "https://github.com/ramp-stack/fig-files"
 
 [dependencies]
-ramp = {package = "ramp2", version = "3.0.3"}
-chk = {path = "../chk"}
+ramp = {package = "ramp2", version = "3.0.4"}
+chk = { features = ["pelican_ui"], path = "../chk"}
 
 futures = "0.3.34"
 include_dir = "0.7.4"
 serde = {version = "1", features = ["derive"]}
+uuid = {version = "1", features = ["v4"]}
 prism = {package = "prism2", version = "3.1.0"}
 resvg = {version = "0.47.0", default-features = false, features = ["text", "system-fonts", "raster-images"]}
 
@@ -59,12 +60,15 @@ team = "RYYG6X8WK7"
 bundle_id = "org.ramp.figfiles"
 minimum_os = "17.0"
 info_plist = "ios/Info.plist"
+entitlements = "ios/FigFiles.entitlements"
 resources = ["ios/FigFilesLaunchScreen.storyboard", "ios/FigFilesLaunchIcon.png"]
 build_number = "6"
 
 [package.metadata.piston.macos]
 team = "RYYG6X8WK7"
 bundle_id = "org.ramp.fig-files"
+info_plist = "macos/Info.plist"
+entitlements = "macos/FigFiles.entitlements"
 
 [package.metadata.piston.developer]
 team = "RYYG6X8WK7"
@@ -75,9 +79,9 @@ enabled = true
 
 [package.metadata.piston.notifications.ios.development]
 team = "RYYG6X8WK7"
-topic = "org.ramp.fig-files"
+topic = "org.ramp.figfiles"
 identity = "023c8a09189d12e0755e224a9e8a6af15b21186758aef12e65b0231757dd3bdee0"
-application = "e4cb0c447e8ea1318948162355cb3bcf1182354421ec0749eb547a2726b4d38a"
+application = "2d6f45a2731693c47d998dc6964140530b678adc039523aa925a38debba95266"
 
 [package.metadata.piston.notifications.ios.production]
 team = "RYYG6X8WK7"

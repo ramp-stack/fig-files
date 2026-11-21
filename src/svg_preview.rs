@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn app_font_supplies_text_when_system_fonts_are_unavailable() {
         use usvg::fontdb::{Database, Family, Query};
-        let theme = chk::Theme::default();
+        let theme = chk::ChkTheme::default().build::<chk::PelicanUi>(chk::Assets::new(Vec::new()));
         let font = theme
             .fonts()
             .get_font("FontStyle::Text")

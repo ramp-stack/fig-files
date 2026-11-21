@@ -4,19 +4,23 @@ A native, AIR-backed file manager built by adapting Orange's Rust / Cargo Piston
 
 ## Run
 
-Clone CHK beside Fig Files: the app currently uses the local `../chk` dependency. With Rust and the native prerequisites for your platform installed:
+Clone a compatible CHK 2 checkout beside Fig Files: the app uses the local `../chk` dependency, including CHK’s contact/profile pages and keyed-form APIs. The current API baseline is commit `1b05d0990d0c212f5b9f8f4f1948c7e2a1fa7163` on `master`. With Rust and the native prerequisites for your platform installed:
 
 ```sh
-git clone https://github.com/ramp-stack/chk.git
+git clone --branch master https://github.com/ramp-stack/chk.git
+git -C chk checkout 1b05d0990d0c212f5b9f8f4f1948c7e2a1fa7163
 git clone https://github.com/ramp-stack/fig-files.git
 cd fig-files
 ```
 
-Then run:
+Resolve dependencies once for the checkout, then run with the lockfile:
 
 ```sh
+cargo build
 cargo run --locked
 ```
+
+The RAMP development workspace may override Ramp, Prism, and native/UI dependencies with sibling paths through a parent Cargo configuration. Current workspace checks also include local CHK changes; a standalone build from the pinned commit has not been verified. Switching between workspace overrides and standalone dependencies requires refreshing `Cargo.lock` with `cargo build` before using `--locked` again.
 
 For platform packaging and native development:
 
@@ -31,12 +35,12 @@ iOS development requires Xcode, a configured Cargo Piston developer identity, an
 
 ## Files and folders
 
-- Browse Files, Shared, Contacts, and Trash. Recent and Favorites are no longer navigation pages.
+- Browse Files, Shared, Contacts, Trash, and Profile. Recent and Favorites are no longer navigation pages.
 - Use the **Add files** bumper in Files or a folder to import files or create a folder. Imports are limited to **8 MiB each**. Search results are a browsing view without import controls.
-- Search file and folder names across the library with the header search button. Library item and byte totals appear below the listing.
+- Search file and folder names with the header search button. From Files, search covers the library; from a folder, it includes only that folder’s contents and descendants, including shared folders inside it. Results update as you type, and tapping a result opens it directly, matching CHK’s Contacts and Messages search. Contacts also search by name or AirName without a Continue step. Library item and byte totals appear below the listing.
 - Opening a file automatically previews raster images, SVGs, PDFs (macOS/iOS), and UTF-8 text, with file artwork while the preview loads. Text previews are limited to 16,000 characters. Use **Info → PDF pages** for Previous, Next, or jumping to a page number.
-- Rename, move, trash, and restore files or complete folder trees.
-- The preview header’s **Info** button opens file details with **Share** and **Delete** rows. Delete confirms before moving files to Trash; deleting a shared root removes only your Files shortcut. **Manage file** holds rename/move and shared editing controls. Folder details use the header manage button.
+- Rename, move, trash, and restore files or complete folder trees. Renaming uses CHK’s edit page with **Save**, matching group editing in Orange, including validation and unsaved-change handling.
+- The preview header’s **Info** button opens file details. Files and folders both use CHK `Display::cta()` actions for **Share**, **Move**, and **Delete**, with no bumper and an **Edit** header button that opens the rename editor. File details also offer **Export file**; shared files add **File contents**. Shared-item pages do not display participant lists or counts. Delete confirms before moving items to Trash. Moving or deleting a shared root affects only your Files shortcut; moving or deleting a nested shared item applies to everyone.
 - Use **Info → Export file** on a file, to hand the original bytes to the system share sheet. Available destinations depend on the platform; iOS includes Save to Files. This is not a native Save As dialog.
 - Use **Send** on the Shared page to choose a file or folder, or use **Share** from a file’s Info page. Everyone who joins gets read and write access to the same item. Shared items remain accessible through shortcuts in Files.
 - Permanent deletion removes an item and its descendants from the library. AIR may retain earlier encrypted history; this is not secure erasure.
@@ -47,17 +51,29 @@ SVG previews support vector paths, text, gradients, and supported embedded raste
 
 ## Shared access
 
-1. The recipient opens **Shared → Receive** and copies their receiving name or shows its QR code.
+1. Open **Shared → Receive** to paste or scan an invitation link, or choose **Show my QR code** to display and share your AirName invitation. To copy the literal AirName, open **Profile → AirName → Copy**.
 2. The sender opens **Shared → Send**, chooses a file or folder, searches and selects one or more contacts, and presses **Continue** to share read/write access. **New contact** opens the paste/QR page, then returns with that person selected.
 3. The recipient opens the invitation in **Shared** and chooses **Join shared file/folder**. A shortcut appears in Files. Both people now use the same shared contents.
 
-Shared presents one list of files and folders, whether you shared them or received access. **Send** and **Receive** are the main buttons. Private saved edits and older copy-based transfers are available from the information button when present.
+Shared presents one list of files and folders, whether you shared them or received access. **Send** and **Receive** are the main buttons. **Receive** uses CHK’s invitation text form with **Paste**, **Scan QR Code**, and **Show my QR code** actions. The information button contains private saved edits and older copy-based transfers when present.
 
-Sharing from file or folder details, including inviting someone to an existing shared item, uses the same CHK search and New contact forms as Orange's new-message flow. It includes saved contacts and people from sharing history. Selected people appear as removable chips, and adding someone keeps existing selections. Selecting or saving a contact does not grant access; **Continue** sends the invitations to the selected people for the same shared item.
+Sharing from file or folder details, including inviting someone to an existing shared item, reuses CHK’s new-message contact selector and built-in **New contact** form. Fig Files changes the outer title to **Share access** and the final action to file sharing. The selector includes saved profiles and people from existing sharing history. When there are no contacts, a CHK action page offers **New contact** and **Create link** without an empty-list message; saving a contact opens the usual recipient selector. Selected people appear as removable chips, and adding someone keeps existing selections. Selecting or saving a contact does not grant access; **Continue** sends the invitations to the selected people for the same shared item.
 
-**Contacts → Add contact** lets you paste or scan someone’s Fig Files receiving name and save it before sharing anything. Contacts also fills automatically from people in your sharing history, including older copies. Adding the same name again opens the existing contact. Select a person, tap **Share files**, choose a file or folder, and confirm **Share access**. Their receiving name is already selected. Saved contacts persist privately across restarts and appear alongside sharing-history contacts without duplicates. Contacts show the full receiving name and any shared items that identify the relationship; merely opening a contact or choosing a file never grants access. Unaccepted incoming invitations do not add unfamiliar people to Contacts.
+**Create link** in that selector is a separate choice. Before enabling a link, Fig Files explains that **anyone with the link can read and edit the file or entire folder, and forward the link**. Links do not expire and existing access cannot be revoked. Only confirming **Create link** enables this access. The link is made available to copy or share after CHK confirms its publication. Selecting contacts and pressing Continue does not enable link access.
 
-Sharing a folder includes its active files, subfolders, and future additions. Everyone who joins can import files, create folders, rename and move items within the shared folder, replace file contents, and use **Shared Trash** to remove or restore items for everyone. **Manage file → Edit text** edits complete UTF-8 files up to 256 KiB; **Replace file** accepts one updated file up to 8 MiB and keeps the existing filename. Previews and exports work for shared items too. This is file-version collaboration, not live co-editing of individual keystrokes, PDF pages, or images.
+Invitation links use `https://therampstack.com/fig-files/invite.html`. File-link capabilities stay in the URL fragment; the website does not receive file contents or tokens. Opening a file link shows **Join shared item** before receiving the shared channel or changing membership. Confirmed membership is required before adding the Files shortcut. Pending publication/join jobs are saved privately and resume after restart; failed jobs have an explicit retry action.
+
+Sharing an **AirName** from Receive or Profile uses a contact invitation link. Opening it saves the contact privately and shows their Fig Files profile; it does not create a chat or share files. The CHK contact forms accept both plain AirNames and these links. The Receive QR encodes the contact invitation link.
+
+iOS handles invitation links through CHK’s native app-link queue, with the custom `fig-files://` scheme as a website fallback. Universal links require the associated-domain entitlement in the installed signed build and the live Apple association file. The current native macOS runtime does not deliver app links; on Mac, use **Shared → Receive** to paste or scan. No shared runtime crate is modified. Website deployment files are in [web/](web/README.md).
+
+**Contacts** reuses CHK’s Contacts home, with its **Search** button, **New Contact** action, and empty state: “No contacts yet. Get started by adding a friend.” **New Contact** opens CHK’s form to paste or scan an AirName and save a private profile. Contact pages retain CHK’s username, avatar, **About me**, and **AirName** controls, including **Copy** and **Display QR Code**. Fig Files adds **Share files** and the existing **Sharing history**. Choose a file or folder from **Share files**, then confirm **Share access** for that contact. Opening a contact or choosing a file never grants access.
+
+**Profile** opens CHK’s **My profile** editor for your username, avatar, and **About me**. Its **AirName** section provides **Copy**, **Display QR Code**, and **Share**.
+
+New contacts are stored in CHK’s private `Profile` contracts. Existing Fig Files address-book entries and contacts from outgoing or accepted sharing history are imported into that store without replacing saved usernames, notes, or avatars. Reopening Contacts does not duplicate existing profiles. Unaccepted incoming invitations do not add unfamiliar people to Contacts.
+
+Sharing a folder includes its active files, subfolders, and future additions. Everyone who joins can import files, create folders, rename and move items within the shared folder, replace file contents, and use **Shared Trash** to remove or restore items for everyone. **Info → File contents → Edit text** edits complete UTF-8 files up to 256 KiB; **Replace file** accepts one updated file up to 8 MiB and keeps the existing filename. Successful text saves stay in the editor, and failed saves retain the unsaved draft. Previews and exports work for shared items too. This is file-version collaboration, not live co-editing of individual keystrokes, PDF pages, or images.
 
 The owner's original library entry becomes a shortcut to the shared item; it does not remain a separately editable copy. Library search and totals include the current shared contents. **Files shortcut**, in the shared item's information page, controls personal placement and removal of the shortcut. Removing a shortcut does not delete the shared contents or revoke access. The shared root remains accessible from Shared.
 
@@ -67,7 +83,7 @@ A shared item supports **128 entries and saved conflicting edits**, **32 MiB tot
 
 Submitted replacement and text-edit bytes are also stored privately under **Shared → information button → Saved edits** before the shared write is queued. These recovery drafts survive restart and can be exported, retried, or explicitly discarded. A draft can remain even after its edit has synced; it is not an error or delivery receipt. If a concurrent change causes a queued write to be rejected at confirmation—for example because the folder is full—the recovery draft remains available. Retrying uses the original base version and preserves conflicts instead of overwriting later edits.
 
-Orange names are AIR public identities, not profile nicknames. Orange and Fig Files normally have different app-local identities. Use the receiving name displayed by the recipient's Fig Files installation. Invitations arrive inside Fig Files; Orange is unchanged.
+An AirName identifies an AIR public identity. Orange and Fig Files normally have different app-local identities. Use the AirName displayed by the recipient's Fig Files installation. Invitations arrive inside Fig Files; Orange is unchanged.
 
 **Shared → information button → Older copies** keeps transfers created by earlier versions of Fig Files available. Those transfers remain snapshots with the original Save to Files behavior. They cannot retroactively become shared access. New invitations use shared access only.
 
@@ -78,10 +94,13 @@ The app's AIR contracts are defined within Fig Files:
 - `Vault` holds the private library index and shared-item shortcuts. `FileBlob` holds immutable private originals.
 - `SharedSpace` holds one canonical shared tree, mutable file bytes, membership, and conflicting versions. Only this channel is shared. The sender's other files, private index, and private Trash remain private.
 - `EditDraft` retains private recovery submissions and is never shared.
-- `AddressBook` privately stores receiving names added from Contacts; adding a name sends no invitation or shared access.
+- `LinkJob` retains private invitation publication/join work and is never shared.
+- `AddressBook` retains previously saved AirNames for migration into CHK profiles.
 - `Transfer` remains available for reading older copy-based exchanges.
 
-AIR authenticates every change. Only active, explicitly invited participants can write or invite others. Pending local changes appear immediately, and other participants see them after AIR synchronization. Offline updates are persisted for retry. Being queued locally is not confirmation that the server or another person has received a change.
+Contacts and Profile use CHK’s private `Profile` contracts. Saving a contact does not send an invitation or grant access to files.
+
+AIR authenticates every change. Only active participants can write or invite others; joining requires either an explicit membership invitation or a valid token from a deliberately enabled file link. Pending local changes appear immediately, and other participants see them after AIR synchronization. Offline updates are persisted for retry. Being queued locally is not confirmation that the server or another person has received a change.
 
 Ramp supplies encrypted transport, local caching, and the persisted app identity. The local cache is not separately encrypted by Fig Files. This version has no account, identity recovery, or cross-device pairing UI; cloning one identity onto concurrent devices is unsupported. Initial promotion of a private subtree to a shared item spans two contracts and assumes one active installation of the private identity. Keep the app's cache and identity data to preserve library access.
 
@@ -89,7 +108,7 @@ Permanent deletion removes entries from the current index; encrypted AIR history
 
 ## Project scope
 
-The duplicate retains Orange's native entrypoint, compatible dependency versions, and useful rendering build settings. Orange messaging, contacts, profiles, wallet draft, GIF configuration, old Xcode project, vendor tree, caches, credentials, and deployment metadata are excluded. The app depends directly on CHK for UI; Pelican UI and PTSD are CHK's internal transitive dependencies. It does not import them or alter their components or drawing instructions. Ramp/Prism provide the application lifecycle, AIR, and native file-picker events.
+The duplicate retains Orange's native entrypoint, compatible dependency versions, and useful rendering build settings. Fig Files reuses CHK’s Contacts, profile, and contact-selection UI. Orange’s messaging screens, wallet draft, GIF configuration, old Xcode project, vendor tree, caches, credentials, and deployment metadata are excluded. The app depends directly on CHK for UI; Pelican UI and PTSD are CHK's internal transitive dependencies. It does not import them or alter their components or drawing instructions. Ramp/Prism provide the application lifecycle, AIR, and native file-picker events.
 
 `icon.png` is the generated native icon master. Cargo Piston derives platform sizes from it. Runtime vector branding, empty states, and semantic icons are in `resources/`; iOS launch resources are in `ios/`. See [the asset inventory and exact generation prompt](design/ASSETS.md).
 
@@ -99,8 +118,10 @@ The bright icon, logo, illustrations, and full-color file artwork remain app-own
 
 ```sh
 cargo fmt --check
-cargo check --locked
+cargo build --locked --bin fig-files
 cargo test --locked --lib
+cargo check --locked --target aarch64-apple-ios --lib
+node --test web/tests/invite.test.cjs
 ```
 
 Tests cover folder constraints, signed collaborator permissions, shared mutations, conflict preservation, private draft recovery, shortcut promotion, byte preservation, limits, legacy transfers, and encrypted collaboration among three identities with offline restart and concurrent edits. Sharing pages are rendered with the real CHK interface at phone and desktop sizes. Build output lives inside this project's ignored `target/` directory.

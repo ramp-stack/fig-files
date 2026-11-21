@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#151219">
+  <title>Fig Files invitation</title>
+  <link rel="icon" type="image/svg+xml" href="./invite-icon.svg">
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #f9f7ff; background: #151219; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100svh; display: grid; grid-template-rows: 1fr auto; padding: 32px 24px 24px; }
+    main { width: min(100%, 400px); margin: auto; text-align: center; padding: 32px 0; }
+    .app-icon { width: 88px; height: 88px; display: block; margin: 0 auto 24px; border-radius: 20px; }
+    .app-name { color: #d7ff62; font-size: 13px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; margin: 0 0 12px; }
+    h1 { margin: 0 0 16px; font-size: clamp(29px, 7vw, 36px); font-weight: 650; letter-spacing: -.035em; line-height: 1.1; }
+    p { margin: 0; line-height: 1.5; }
+    #invitation-description { color: #d8d1e0; font-size: 17px; }
+    #invitation-detail { color: #a69bad; font-size: 14px; margin: 12px 0 28px; }
+    .open-app { display: block; color: #20132e; background: #d7ff62; text-decoration: none; font-size: 16px; font-weight: 650; border-radius: 18px; padding: 17px 24px; transition: background .15s; }
+    .open-app:hover { background: #e5ff99; }
+    .open-app:focus-visible, footer a:focus-visible { outline: 3px solid #ff64bc; outline-offset: 5px; }
+    [hidden] { display: none !important; }
+    noscript p { margin: 20px 0 0; color: #d8d1e0; font-size: 14px; }
+    footer { text-align: center; font-size: 14px; line-height: 1.6; color: #a69bad; }
+    footer a { color: #d8d1e0; text-underline-offset: 4px; }
+    @media (prefers-reduced-motion: reduce) { .open-app { transition: none; } }
+  </style>
+</head>
+<body>
+  <main aria-labelledby="invitation-title">
+    <img class="app-icon" src="./invite-icon.svg" alt="" width="88" height="88">
+    <p class="app-name">Fig Files</p>
+    <div aria-live="polite">
+      <h1 id="invitation-title">Fig Files invitation</h1>
+      <p id="invitation-description">Open a shared file or add a contact in Fig Files.</p>
+      <p id="invitation-detail">Open this invitation with the Fig Files app.</p>
+    </div>
+    <a id="open-app" class="open-app" hidden>Open Fig Files</a>
+    <noscript><p>Enable JavaScript to open this invitation, or paste the invitation link into Fig Files.</p></noscript>
+  </main>
+  <footer>Need the app? <a href="https://therampstack.com/fig-files/" rel="noreferrer">About Fig Files</a></footer>
+  <script src="./invite.js" defer></script>
+</body>
+</html>

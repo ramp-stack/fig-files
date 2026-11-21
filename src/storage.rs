@@ -201,10 +201,8 @@ impl Contract for Vault {
                     return Err(StorageError::SharedMount);
                 }
                 self.validate_destination(parent, &name, None)?;
-                if let EntryKind::File { size, .. } = kind {
-                    if size > MAX_FILE_SIZE as u64 {
-                        return Err(StorageError::FileTooLarge);
-                    }
+                if let EntryKind::File { size, .. } = kind && size > MAX_FILE_SIZE as u64 {
+                    return Err(StorageError::FileTooLarge);
                 }
                 self.entries.insert(
                     id,
@@ -498,15 +496,10 @@ impl Vault {
         except: Option<EntryId>,
     ) -> Result<(), StorageError> {
         validate_name(name)?;
-        if let Some(parent) = parent {
-            if !self
-                .entries
-                .get(&parent)
-                .is_some_and(|entry| matches!(entry.kind, EntryKind::Folder))
-                || self.is_trashed(parent)
-            {
-                return Err(StorageError::InvalidFolder);
-            }
+        if let Some(parent) = parent
+            && (!self.entries.get(&parent).is_some_and(|entry| matches!(entry.kind, EntryKind::Folder))
+                || self.is_trashed(parent)) {
+            return Err(StorageError::InvalidFolder);
         }
         if self.entries.values().any(|entry| {
             Some(entry.id) != except

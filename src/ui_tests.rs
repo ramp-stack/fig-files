@@ -6,6 +6,8 @@ use crate::{
     contacts::{self, AddressBook},
     contacts_ui,
     drafts::{self, EditDraft},
+    invitation_delivery::{DeliverLink, JobAction, LinkJob, LinkJobs, Purpose, Status},
+    invitations::{self, FileInvitation, Invitation, LinkSource},
     preview, runtime,
     sharing::{
         self, Transfer, TransferAction, TransferInit, TransferItem, TransferKind, TransferStatus,
@@ -13,20 +15,26 @@ use crate::{
     sharing_ui,
     storage::{self, FileBlob, Vault},
 };
+use chk::blocking::Block;
+use chk::messages::{ChatRoom, ContactNotificationState, RoomNotificationState};
+use chk::profiles::{Profile, ProfileAction};
 use chk::{App, Assets, Bumper, Context, Display, Icons, Page, PageType, Theme};
 use futures::FutureExt;
 use prism::{
-    Application, Window,
+    Window,
     air::{Contract, ContractType, Id, Metadata, Name, Request, Value},
     drawable::{Drawable, Instruction, Item},
     hardware, traits,
 };
 use std::{
-    any::Any,
+    any::{Any, TypeId},
     collections::HashMap,
     marker::PhantomData,
     sync::{Arc, Mutex},
 };
+
+type ContractStore = HashMap<(Id, Id), Box<dyn Any + Send + Sync>>;
+type ShareLog = Arc<Mutex<Option<Vec<(Id, Id, Name)>>>>;
 
 #[derive(Clone, Default)]
 struct TestKeyboard;
@@ -37,8 +45,13 @@ impl traits::Keyboard for TestKeyboard {
         false
     }
 }
+type HardwareLog = Arc<Mutex<Vec<(&'static str, String)>>>;
+
 #[derive(Clone, Default)]
-struct TestHardware;
+struct TestHardware {
+    commands: Option<HardwareLog>,
+    clipboard: Option<String>,
+}
 struct CancelledPick<T>(PhantomData<T>);
 impl<T: Clone + 'static> traits::Picked<T> for CancelledPick<T> {
     async fn get(&mut self) -> hardware::PickResult<T> {
@@ -67,14 +80,26 @@ impl traits::Hardware for TestHardware {
     fn start_capture(&self) -> Result<hardware::Capture, String> {
         Err("No capture".into())
     }
-    fn share(&self, _: &hardware::Data) {
-        panic!("Rendering must not share files")
+    fn share(&self, data: &hardware::Data) {
+        let Some(commands) = &self.commands else {
+            panic!("Rendering must not share files");
+        };
+        let hardware::Data::Text(value) = data else {
+            panic!("Invitation actions must share a text link");
+        };
+        commands.lock().unwrap().push(("share", value.clone()));
     }
-    fn set_clipboard(&self, _: &hardware::Data) {
-        panic!("Rendering must not write the clipboard")
+    fn set_clipboard(&self, data: &hardware::Data) {
+        let Some(commands) = &self.commands else {
+            panic!("Rendering must not write the clipboard");
+        };
+        let hardware::Data::Text(value) = data else {
+            panic!("Invitation actions must copy a text link");
+        };
+        commands.lock().unwrap().push(("copy", value.clone()));
     }
     fn get_clipboard(&self) -> Option<hardware::Data> {
-        None
+        self.clipboard.clone().map(hardware::Data::Text)
     }
     fn set_cache(&self, _: &str, _: &hardware::Data) -> Result<(), String> {
         Ok(())
@@ -85,16 +110,21 @@ impl traits::Hardware for TestHardware {
     fn trigger_haptic(&self) {}
 }
 
-type ShareLog = Arc<Mutex<Option<Vec<(Id, Id, Name)>>>>;
 #[derive(Clone, Debug)]
 struct MemoryAir(
-    Arc<Mutex<HashMap<(Id, Id), Box<dyn Any + Send + Sync>>>>,
+    Arc<Mutex<ContractStore>>,
     ShareLog,
     Name,
+    Arc<Mutex<Vec<prism::service::Key>>>,
 );
 impl MemoryAir {
     fn with_name(name: Name) -> Self {
-        Self(Default::default(), Default::default(), name)
+        Self(
+            Default::default(),
+            Default::default(),
+            name,
+            Default::default(),
+        )
     }
 }
 impl Default for MemoryAir {
@@ -310,14 +340,39 @@ impl traits::Air for MemoryAir {
             Box::new(Instances::<SharedSpace>(self.clone(), PhantomData))
         } else if contract.id == EditDraft::id() {
             Box::new(Instances::<EditDraft>(self.clone(), PhantomData))
+        } else if contract.id == LinkJob::id() {
+            Box::new(Instances::<LinkJob>(self.clone(), PhantomData))
         } else if contract.id == AddressBook::id() {
             Box::new(Instances::<AddressBook>(self.clone(), PhantomData))
+        } else if contract.id == Profile::id() {
+            Box::new(Instances::<Profile>(self.clone(), PhantomData))
+        } else if contract.id == Block::id() {
+            Box::new(Instances::<Block>(self.clone(), PhantomData))
+        } else if contract.id == ContactNotificationState::id() {
+            Box::new(Instances::<ContactNotificationState>(
+                self.clone(),
+                PhantomData,
+            ))
+        } else if contract.id == RoomNotificationState::id() {
+            Box::new(Instances::<RoomNotificationState>(
+                self.clone(),
+                PhantomData,
+            ))
+        } else if contract.id == ChatRoom::id() {
+            Box::new(Instances::<ChatRoom>(self.clone(), PhantomData))
         } else {
             panic!("Fig Files must not start unused contracts: {}", contract.id)
         }
     }
-    fn start(&self, _: prism::service::ServiceInit) {
-        panic!("Unexpected background service")
+    fn start(&self, service: prism::service::ServiceInit) {
+        assert!(
+            service.key == prism::service::Key::new::<LinkJobs>(self.2, &())
+                || service.key.0 == TypeId::of::<DeliverLink>(),
+            "Unexpected background service: {:?}",
+            service.key,
+        );
+        // Record scheduling, but never poll a service or connect to the network.
+        self.3.lock().unwrap().push(service.key);
     }
     fn shutdown(&self, _: prism::service::Key) {
         panic!("Unexpected background service")
@@ -352,14 +407,13 @@ impl<C: Contract> traits::DynInstances for Instances<C> {
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|((kind, id), stored)| {
-                (*kind == C::id()).then(|| {
-                    (
-                        *id,
-                        Box::new(stored.downcast_ref::<Stored<C>>().unwrap().clone())
-                            as Box<dyn traits::DynInstance>,
-                    )
-                })
+            .filter(|((kind, _), _)| *kind == C::id())
+            .map(|((_, id), stored)| {
+                (
+                    *id,
+                    Box::new(stored.downcast_ref::<Stored<C>>().unwrap().clone())
+                        as Box<dyn traits::DynInstance>,
+                )
             })
             .collect()
     }
@@ -442,7 +496,7 @@ fn context(mobile: bool) -> Context {
 fn context_with_air(mobile: bool) -> (Context, MemoryAir) {
     let air = MemoryAir::default();
     let ctx = Context::new(
-        TestHardware,
+        TestHardware::default(),
         prism::air::Air::new(air.clone()),
         Window {
             size: if mobile {
@@ -459,7 +513,7 @@ fn context_with_air(mobile: bool) -> (Context, MemoryAir) {
 fn theme() -> Theme {
     FigFiles
         .theme()
-        .to_pelican(Assets::new(vec![include_dir::include_dir!(
+        .build::<chk::PelicanUi>(Assets::new(vec![include_dir::include_dir!(
             "$CARGO_MANIFEST_DIR/resources"
         )]))
 }
@@ -473,24 +527,35 @@ fn page_description(page: Page, ctx: &mut Context, theme: &Theme) -> PageType {
     }
 }
 
-fn header_description(page: PageType, ctx: &mut Context, theme: &Theme) -> (Icons, PageType) {
+fn header_description(page: PageType, ctx: &mut Context, theme: &Theme) -> (Icons, String) {
     let header = match page {
-        PageType::Root { header, .. }
-        | PageType::Display { header, .. }
-        | PageType::Photo { header, .. } => header,
-        _ => panic!("Expected a root, display or photo page"),
+        PageType::Content { header, .. } | PageType::EdgeToEdge { header, .. } => header,
+        _ => panic!("Expected a content or edge-to-edge page"),
     };
-    let (icon, mut builder) = header.expect("This page needs a header action");
-    let flow = builder(ctx, theme);
-    assert_eq!(flow.0.len(), 1, "The header should open one focused page");
-    (
-        icon,
-        page_description(flow.0.into_iter().next().unwrap(), ctx, theme),
-    )
+    let action = match header {
+        chk::design_system::Header::Stack { action, .. }
+        | chk::design_system::Header::Home { action, .. } => action,
+        _ => None,
+    };
+    let (icon, mut action) = action.expect("This page needs a header action");
+    let page = PageType::display("Test", vec![], None, Bumper::None, chk::Offset::Start)
+        .build_root(ctx, theme);
+    let mut view = theme.interface(
+        ctx,
+        vec![chk::RootInfo {
+            icon: chk::RootIcon::Icon(Icons::Info),
+            label: "Test".into(),
+            page,
+        }],
+        None,
+    );
+    draw(view.as_mut(), ctx);
+    action(ctx, theme);
+    (icon, text(&draw(view.as_mut(), ctx)))
 }
 
 fn is_loading_preview(page: &PageType) -> bool {
-    matches!(page, PageType::Display { items, .. } if items.iter().any(|item| matches!(item, Display::Text { text, .. } if text.contains("Loading preview"))))
+    matches!(page, PageType::Content { items, .. } if items.iter().any(|item| matches!(item, chk::Item::Display(Display::Text { text, .. }) if text.contains("Loading preview"))))
 }
 
 fn wait_for_preview(
@@ -513,47 +578,92 @@ fn wait_for_preview(
     }
 }
 
-fn page_body(page: &PageType) -> &[Display] {
+fn page_body(page: &PageType) -> Vec<&Display> {
     match page {
-        PageType::Root { display, .. } => display,
-        PageType::Display { items, .. } => items,
+        PageType::Content { items, .. } => items
+            .iter()
+            .filter_map(|item| match item {
+                chk::Item::Display(display) => Some(display),
+                chk::Item::Input(_) => None,
+            })
+            .collect(),
         _ => panic!("Expected a root or display page"),
     }
+}
+
+fn form_value(id: &str, state: chk::State) -> chk::FormValues {
+    chk::FormValues::new([(id.into(), state)])
 }
 
 fn primary_label(page: &PageType) -> Option<&str> {
     match page {
-        PageType::Root { bumper_a, .. } => bumper_a.as_ref().map(|(label, _)| label.as_str()),
-        PageType::Display {
+        PageType::Content {
+            bumper: Bumper::Footer(chk::design_system::Footer::Home { first, .. }),
+            ..
+        } => first.as_ref().map(|(label, _)| label.as_str()),
+        PageType::Content {
             bumper: Bumper::Custom { label, .. },
             ..
         } => Some(label.as_str()),
-        PageType::Display { .. } => None,
+        PageType::Content { .. } => None,
         _ => panic!("Expected a root or display page"),
     }
 }
 
+fn cta_action_labels(page: &PageType) -> Vec<&str> {
+    page_body(page)
+        .into_iter()
+        .filter_map(|display| match display {
+            Display::Cta { label, actions, .. } if !actions.is_empty() => Some(label.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn manual_recipient_page(selector: PageType, ctx: &mut Context, theme: &Theme) -> PageType {
-    let PageType::Form {
-        title,
-        item:
-            chk::Input::Search {
-                label,
-                actions: Some(actions),
-                ..
-            },
-        ..
-    } = selector
-    else {
-        panic!("Sharing starts with Orange's contact search form");
+    let flow = match selector {
+        PageType::Form {
+            id,
+            title,
+            item: chk::Input::Selection(selector),
+            ..
+        } => {
+            assert_eq!(id, "recipients");
+            assert_eq!(title, "Share access");
+            // CHK's selector handles are public; its quick-action navigation
+            // is also exercised by taps in the populated-contact flow below.
+            chk::Flow::from_form(chk::Form::select_contact(
+                &invitations::contacts(),
+                theme,
+                selector.id,
+                vec![],
+            ))
+        }
+        PageType::Content { header, items, .. } => {
+            assert_eq!(header.title(), "Share access");
+            let actions = items
+                .into_iter()
+                .find_map(|item| match item {
+                    chk::Item::Display(Display::Cta { label, actions, .. })
+                        if label == "New contact" =>
+                    {
+                        Some(actions)
+                    }
+                    _ => None,
+                })
+                .expect("Empty contact choices must expose the New contact CTA");
+            assert_eq!(actions.len(), 1);
+            assert_eq!(
+                actions[0].presentation().label,
+                chk::ActionItem::format_label("New contact")
+            );
+            // The CTA's private ActionItem flow is exercised through actual
+            // New contact / Paste / Continue taps below; reuse the same CHK
+            // form here only to inspect its standard text controls.
+            chk::Flow::from_form(chk::Form::new_contact(&invitations::contacts()))
+        }
+        _ => panic!("Sharing offers contact selection or New contact/Create link choices"),
     };
-    assert_eq!(title, "Share access");
-    assert_eq!(label, "contact name");
-    let (label, _, icon, chk::Action::Flow { flow }) = &actions[0] else {
-        panic!("The New contact quick action must open a CHK flow");
-    };
-    assert_eq!(label, "New contact");
-    assert_eq!(*icon, Icons::Add);
     assert_eq!(flow.0.len(), 1);
     let form = page_description(flow.0[0].clone(), ctx, theme);
     let PageType::Form {
@@ -566,18 +676,32 @@ fn manual_recipient_page(selector: PageType, ctx: &mut Context, theme: &Theme) -
     else {
         panic!("Manual receiving names use CHK's text form");
     };
+    assert_text_actions(actions);
+    assert!(
+        matches!(&form, PageType::Form { id, title, .. } if id == "airname" && title == "New contact")
+    );
+    form
+}
+
+fn assert_text_actions(actions: &[chk::ActionItem]) {
+    let presentation = actions
+        .iter()
+        .map(|action| {
+            let item = action.presentation();
+            (item.label, item.active, item.icon)
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        actions
-            .iter()
-            .map(|(label, _, icon, _)| (label.as_str(), *icon))
-            .collect::<Vec<_>>(),
+        presentation,
         vec![
-            ("Paste clipboard", Icons::Paste),
-            ("Scan QR code", Icons::QrCode)
+            (
+                "Paste Clipboard".into(),
+                Some("Pasted".into()),
+                Icons::Paste
+            ),
+            ("Scan QR Code".into(), None, Icons::QrCode),
         ]
     );
-    assert!(matches!(&form, PageType::Form { title, .. } if title == "New contact"));
-    form
 }
 
 fn settle(view: &mut dyn Drawable, ctx: &mut Context) {
@@ -723,11 +847,17 @@ fn pdf_page_selector_renders_one_based_page_and_only_available_navigation_action
                 on_submit.is_some(),
                 "Entering a page must have a submit action"
             );
-            let actual: Vec<_> = actions
-                .as_deref()
-                .unwrap_or_default()
+            let actual = actions.as_deref().unwrap_or_default();
+            let expected_actions: Vec<_> = expected_actions
+                .into_iter()
+                .map(|(label, icon)| (chk::ActionItem::format_label(label), icon))
+                .collect();
+            let actual: Vec<_> = actual
                 .iter()
-                .map(|(label, _, icon, _)| (label.as_str(), *icon))
+                .map(|action| {
+                    let item = action.presentation();
+                    (item.label, item.icon)
+                })
                 .collect();
             assert_eq!(actual, expected_actions);
             assert_eq!(
@@ -756,12 +886,16 @@ fn pdf_page_selector_renders_one_based_page_and_only_available_navigation_action
 fn real_application_and_all_empty_roots_render_on_phone_and_desktop() {
     for mobile in [true, false] {
         let mut ctx = context(mobile);
-        let mut app = FigFiles::new(&mut ctx);
-        assert!(text(&draw(&mut app, &mut ctx)).contains("Fig Files"));
+        let mut app = <FigFiles as prism::Application>::new(&mut ctx);
+        assert!(
+            text(&draw(&mut app, &mut ctx))
+                .lines()
+                .any(|line| line == "Files")
+        );
         let vault = storage::open(&ctx.air);
         for (location, expected) in [
-            (browser::Location::Folder(None), "Room for your next idea"),
-            (browser::Location::Trash, "All clear"),
+            (browser::Location::Folder(None), "No files yet."),
+            (browser::Location::Trash, "Trash is empty."),
         ] {
             let mut page =
                 browser::listing(vault.clone(), location, true).build_root(&mut ctx, &theme());
@@ -775,24 +909,32 @@ fn real_application_and_all_empty_roots_render_on_phone_and_desktop() {
 }
 
 #[test]
-fn navigation_roots_are_files_shared_contacts_and_trash_in_that_order() {
+fn navigation_roots_keep_files_shared_contacts_trash_and_add_standard_profile() {
     for mobile in [true, false] {
         let (mut ctx, air) = context_with_air(mobile);
-        let roots = FigFiles.roots(&mut ctx, &theme());
+        let roots = FigFiles.roots(&mut ctx, &theme(), None);
         let actual: Vec<_> = roots
             .iter()
-            .map(|root| (root.0.label.as_str(), root.0.icon))
+            .map(|root| {
+                (
+                    root.label.as_str(),
+                    match &root.icon {
+                        chk::RootIcon::Icon(icon) => Some(*icon),
+                        chk::RootIcon::Avatar(_) => None,
+                    },
+                )
+            })
             .collect();
         assert_eq!(
             actual,
             vec![
-                ("Files", Icons::Home),
-                ("Shared", Icons::Send),
-                ("Contacts", Icons::Group),
-                ("Trash", Icons::Delete),
+                ("Files", Some(Icons::Home)),
+                ("Shared", Some(Icons::Send)),
+                ("Contacts", Some(Icons::Group)),
+                ("Trash", Some(Icons::Delete)),
+                ("Profile", Some(Icons::Profile)),
             ]
         );
-        assert!(roots.iter().all(|root| root.0.page.is_some()));
         assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
         assert!(ctx.air.instances::<Transfer>().list().is_empty());
         assert!(air.1.lock().unwrap().is_none());
@@ -939,18 +1081,20 @@ fn contacts_empty_and_populated_pages_render_without_sharing_or_changing_history
         let (mut ctx, air) = context_with_air(mobile);
         let theme = theme();
         let empty = page_description(contacts_ui::home(), &mut ctx, &theme);
-        assert!(
-            matches!(&empty, PageType::Root { title, header: None, bumper_b: None, .. } if title == "Contacts")
-        );
-        assert_eq!(primary_label(&empty), Some("Add contact"));
+        assert!(matches!(&empty, PageType::Content {
+            header: chk::design_system::Header::Home {title, action: Some((Icons::Search, _))},
+            bumper: Bumper::Footer(chk::design_system::Footer::Home {second: None, ..}), ..
+        } if title == "Contacts"));
+        assert_eq!(primary_label(&empty), Some("New Contact"));
         let mut rendered = Page::Static(Box::new(empty)).build_root(&mut ctx, &theme);
+        let visible = text(&draw(rendered.as_mut(), &mut ctx));
         assert!(
-            text(&draw(rendered.as_mut(), &mut ctx))
-                .contains("Add someone by their Fig Files receiving name.")
+            visible.contains("No contacts yet.")
+                && visible.contains("Get started by adding a friend.")
         );
         assert!(
             air.0.lock().unwrap().is_empty(),
-            "Empty Contacts must not create AIR records"
+            "Empty Contacts must not create records"
         );
 
         let outgoing = shared_fixture(&ctx, &air, false, true, MemberStatus::Active);
@@ -960,66 +1104,35 @@ fn contacts_empty_and_populated_pages_render_without_sharing_or_changing_history
         let mut invalid = legacy.pending().clone();
         invalid.items[0].name = "invalid/contact-title".into();
         stored_fixture(&ctx, &air, Id::random(), invalid);
+        contacts_ui::sync_profiles(&mut ctx);
+        let mut profile = Profile::try_from_name(&mut ctx, peer()).unwrap();
+        profile.send(ProfileAction::ChangeUsername("Casey".into()));
         let before = air.0.lock().unwrap().len();
         let members = outgoing.pending().members.clone();
         let home = page_description(contacts_ui::home(), &mut ctx, &theme);
-        let titles: Vec<_> = page_body(&home)
-            .iter()
-            .filter_map(|display| match display {
-                Display::List { items, .. } => Some(items),
-                _ => None,
-            })
-            .flatten()
-            .map(|item| item.title.clone())
-            .collect();
+        let titles = list_titles(&home);
         assert_eq!(
-            titles.len(),
-            1,
-            "Repeated sharing with the same AIR name is one contact"
+            titles,
+            ["Casey"],
+            "One CHK profile represents repeated sharing"
         );
         let mut rendered = Page::Static(Box::new(home)).build_root(&mut ctx, &theme);
-        assert!(text(&draw(rendered.as_mut(), &mut ctx)).contains("3 shared items"));
+        assert!(text(&draw(rendered.as_mut(), &mut ctx)).contains("Casey"));
 
         let detail = page_description(contacts_ui::detail(peer()), &mut ctx, &theme);
-        assert_eq!(primary_label(&detail), Some("Share files"));
-        let PageType::Display {
-            bumper:
-                Bumper::Custom {
-                    action: chk::Action::Flow { flow },
-                    secondary,
-                    ..
-                },
-            ..
-        } = &detail
-        else {
-            panic!("A contact should open the file picker through a pure CHK flow");
-        };
-        assert_eq!(
-            secondary.as_ref().map(|(label, _)| label.as_str()),
-            Some("Copy name")
-        );
-        assert_eq!(flow.0.len(), 1);
-        let picker = page_description(flow.0[0].clone(), &mut ctx, &theme);
-        assert!(matches!(&picker, PageType::Display { title, .. } if title == "Share files"));
-        let mut rendered = Page::Static(Box::new(detail)).build(&mut ctx, &theme, None, 1);
-        let visible = text(&draw(rendered.as_mut(), &mut ctx));
-        assert!(
-            visible
-                .split_whitespace()
-                .collect::<String>()
-                .contains(&peer().to_string())
-        );
-        for expected in [
-            "Sharing history",
-            "owned-folder",
-            "received-note.txt",
-            "sent-note.txt",
-        ] {
-            assert!(visible.contains(expected), "Missing {expected}: {visible}");
+        assert_profile_contact(&detail, peer());
+        let titles = list_titles(&detail);
+        for expected in ["owned-folder", "received-note.txt", "sent-note.txt"] {
+            assert!(titles.iter().any(|title| title == expected));
         }
-        assert!(has_button_label(&visible, "Share files"));
-        assert!(!visible.contains("received-folder"));
-        assert!(!visible.contains("invalid/contact-title"));
+        assert!(
+            !titles
+                .iter()
+                .any(|title| title == "received-folder" || title == "invalid/contact-title")
+        );
+        let (icon, editor) = header_description(detail, &mut ctx, &theme);
+        assert_eq!(icon, Icons::Edit);
+        assert!(editor.contains("Edit profile") && editor.contains("Username"));
         let absent = page_description(
             contacts_ui::detail(air::Secret::new().name()),
             &mut ctx,
@@ -1027,7 +1140,7 @@ fn contacts_empty_and_populated_pages_render_without_sharing_or_changing_history
         );
         assert_eq!(primary_label(&absent), None);
         assert!(
-            matches!(absent, PageType::Display { title, .. } if title == "Contact unavailable")
+            matches!(absent, PageType::Content { header, .. } if header.title() == "Contact unavailable")
         );
         assert_eq!(outgoing.pending().members, members);
         assert_eq!(
@@ -1037,28 +1150,95 @@ fn contacts_empty_and_populated_pages_render_without_sharing_or_changing_history
         assert_eq!(unaccepted.pending().status, TransferStatus::Pending);
         assert_eq!(air.0.lock().unwrap().len(), before);
         assert!(ctx.air.instances::<Vault>().list().is_empty());
+        assert!(ctx.air.instances::<ChatRoom>().list().is_empty());
+        assert!(ctx.air.instances::<Block>().list().is_empty());
         assert!(air.1.lock().unwrap().is_none());
     }
 }
 
+fn list_titles(page: &PageType) -> Vec<String> {
+    page_body(page)
+        .into_iter()
+        .filter_map(|display| match display {
+            Display::List { items, .. } => Some(items),
+            _ => None,
+        })
+        .flatten()
+        .map(|item| item.title.clone())
+        .collect()
+}
+
+fn assert_profile_contact(page: &PageType, name: Name) {
+    let body = page_body(page);
+    assert!(
+        body.iter()
+            .any(|item| matches!(item, Display::Avatar { .. }))
+    );
+    assert!(
+        body.iter()
+            .any(|item| matches!(item, Display::Cta {label, ..} if label == "About me"))
+    );
+    let Some(Display::Cta {
+        instructions,
+        actions,
+        ..
+    }) = body
+        .iter()
+        .copied()
+        .find(|item| matches!(item, Display::Cta {label, ..} if label == "AirName"))
+    else {
+        panic!("Contacts must retain CHK's AirName and copy/QR controls");
+    };
+    assert_eq!(instructions, &name.to_string());
+    let labels: Vec<_> = actions
+        .iter()
+        .map(|action| action.presentation().label)
+        .collect();
+    assert_eq!(labels, ["Copy", "Display QR Code"]);
+    let actions: Vec<_> = body
+        .iter()
+        .filter_map(|item| match item {
+            Display::Cta { label, actions, .. } if label == "Files" => Some(actions),
+            _ => None,
+        })
+        .flatten()
+        .map(|action| action.presentation().label)
+        .collect();
+    assert_eq!(
+        actions,
+        ["Share Files"],
+        "File contact actions must not create chats or block channels"
+    );
+}
+
 #[test]
-fn adding_a_contact_uses_a_pure_name_form_and_only_persists_on_valid_submission() {
+fn adding_a_contact_uses_the_standard_airname_form_and_only_persists_on_valid_submission() {
     for mobile in [true, false] {
+        let (mut navigation_ctx, navigation_air) = context_with_air(mobile);
+        let navigation_theme = theme();
+        let mut app = <FigFiles as prism::Application>::new(&mut navigation_ctx);
+        draw(&mut app, &mut navigation_ctx);
+        let before = navigation_air.0.lock().unwrap().len();
+        browser::show(&mut navigation_ctx, &navigation_theme, contacts_ui::home());
+        tap_text(&mut app, &mut navigation_ctx, "New Contact");
+        let visible = text(&draw(&mut app, &mut navigation_ctx));
+        assert!(visible.contains("New contact") && visible.contains("AirName"));
+        assert!(
+            has_button_label(&visible, "Paste Clipboard")
+                && has_button_label(&visible, "Scan QR Code")
+        );
+        tap_text(&mut app, &mut navigation_ctx, "Scan QR Code");
+        assert!(text(&draw(&mut app, &mut navigation_ctx)).contains("AirName"));
+        assert_eq!(navigation_air.0.lock().unwrap().len(), before);
+        assert!(navigation_air.1.lock().unwrap().is_none());
+
         let (mut ctx, air) = context_with_air(mobile);
         let theme = theme();
-        let home = page_description(contacts_ui::home(), &mut ctx, &theme);
-        let PageType::Root {
-            bumper_a: Some((label, mut add)),
-            ..
-        } = home
-        else {
-            panic!("Contacts must expose Add contact as its primary action");
-        };
-        assert_eq!(label, "Add contact");
-        let flow = add(&mut ctx, &theme);
+        let flow = contacts_ui::add_flow(&theme);
         assert_eq!(flow.0.len(), 1);
         let form = page_description(flow.0[0].clone(), &mut ctx, &theme);
         let PageType::Form {
+            id,
             title,
             item:
                 chk::Input::Text {
@@ -1069,158 +1249,203 @@ fn adding_a_contact_uses_a_pure_name_form_and_only_persists_on_valid_submission(
             ..
         } = form.clone()
         else {
-            panic!("Adding a contact uses the CHK text form");
+            panic!("Adding a contact uses CHK's AirName form");
         };
-        assert_eq!(title, "Add contact");
-        assert_eq!(
-            actions
-                .iter()
-                .map(|(label, _, icon, _)| (label.as_str(), *icon))
-                .collect::<Vec<_>>(),
-            vec![
-                ("Paste clipboard", Icons::Paste),
-                ("Scan QR code", Icons::QrCode)
-            ]
-        );
-        assert!(matches!(actions[0].3, chk::Action::Paste { .. }));
-        assert!(matches!(actions[1].3, chk::Action::Flow { .. }));
+        assert_eq!(id, "airname");
+        assert_eq!(title, "New contact");
+        assert_text_actions(&actions);
         let mut rendered = Page::Static(Box::new(form)).build(&mut ctx, &theme, None, 1);
-        let visible = text(&draw(rendered.as_mut(), &mut ctx));
-        assert!(visible.contains("Add contact"));
-        for label in ["Paste clipboard", "Scan QR code"] {
-            assert!(
-                has_button_label(&visible, label),
-                "Missing {label}: {visible}"
-            );
-        }
-        assert!(
-            air.0.lock().unwrap().is_empty(),
-            "Opening and drawing Add contact must remain read-only"
-        );
-
+        assert!(text(&draw(rendered.as_mut(), &mut ctx)).contains("AirName"));
+        assert!(air.0.lock().unwrap().is_empty());
         for input in [
             "".to_string(),
             "not-an-air-name".into(),
             "03".into(),
             me().to_string(),
         ] {
-            assert!(contacts::parse(&input, me()).is_err());
-            submit(&mut ctx, &vec![chk::State::Text(input)]);
+            submit(&mut ctx, &form_value("airname", chk::State::Text(input)));
             assert!(
                 air.0.lock().unwrap().is_empty(),
-                "Invalid submission must not create an address book"
+                "Invalid names cannot create a profile"
             );
             ctx.events();
         }
-        let pasted = format!("  \n{}\t ", peer());
-        assert_eq!(contacts::parse(&pasted, me()), Ok(peer()));
-        submit(&mut ctx, &vec![chk::State::Text(pasted)]);
-        ctx.events();
-        let books = ctx.air.instances::<AddressBook>().list();
-        assert_eq!(books.len(), 1);
-        let state = books.values().next().unwrap().pending();
-        assert_eq!(state.owner, me());
-        assert_eq!(
-            state.contacts.keys().copied().collect::<Vec<_>>(),
-            vec![peer()]
+        let result = submit(
+            &mut ctx,
+            &form_value("airname", chk::State::Text(format!("  \n{}\t ", peer()))),
         );
-        let first_added = state.contacts[&peer()];
-        drop(state);
-        submit(&mut ctx, &vec![chk::State::Text(peer().to_string())]);
-        ctx.events();
-        assert_eq!(ctx.air.instances::<AddressBook>().list().len(), 1);
-        assert_eq!(
-            books.values().next().unwrap().pending().contacts[&peer()],
-            first_added
+        assert!(matches!(result, chk::FormComplete::Next(_)));
+        let profile = Profile::try_from_name(&mut ctx, peer()).unwrap();
+        let saved = profile.pending().clone();
+        assert_eq!(saved.name, Some(peer()));
+        assert!(!saved.username.is_empty());
+        submit(
+            &mut ctx,
+            &form_value("airname", chk::State::Text(peer().to_string())),
         );
+        assert_eq!(*profile.pending(), saved);
+        assert_eq!(ctx.air.instances::<Profile>().list().len(), 1);
         assert_eq!(
             air.0.lock().unwrap().len(),
             1,
-            "Adding a contact creates only the private address book"
+            "Only the private CHK profile is stored"
         );
+        assert!(ctx.air.instances::<AddressBook>().list().is_empty());
         assert!(ctx.air.instances::<Vault>().list().is_empty());
         assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
         assert!(ctx.air.instances::<Transfer>().list().is_empty());
+        assert!(ctx.air.instances::<ChatRoom>().list().is_empty());
         assert!(air.1.lock().unwrap().is_none());
     }
 }
 
 #[test]
-fn manually_added_contacts_render_and_merge_with_later_sharing_history() {
+fn standard_profiles_render_and_merge_with_later_sharing_history() {
     for mobile in [true, false] {
         let (mut ctx, air) = context_with_air(mobile);
         let theme = theme();
-        contacts::add(&ctx.air, peer()).unwrap();
+        let mut profile = Profile::from_name(&mut ctx, peer());
+        profile.send(ProfileAction::ChangeUsername("Alex Example".into()));
         let before = air.0.lock().unwrap().len();
         let home = page_description(contacts_ui::home(), &mut ctx, &theme);
-        assert_eq!(primary_label(&home), Some("Add contact"));
-        let rows = page_body(&home)
-            .iter()
-            .filter_map(|item| match item {
-                Display::List { items, .. } => Some(items),
-                _ => None,
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 1);
-        let mut rendered = Page::Static(Box::new(home)).build_root(&mut ctx, &theme);
-        assert!(text(&draw(rendered.as_mut(), &mut ctx)).contains("No shared files yet"));
+        assert_eq!(primary_label(&home), Some("New Contact"));
+        assert_eq!(list_titles(&home), ["Alex Example"]);
         let detail = page_description(contacts_ui::detail(peer()), &mut ctx, &theme);
-        assert_eq!(primary_label(&detail), Some("Share files"));
-        let PageType::Display {
-            bumper:
-                Bumper::Custom {
-                    action: chk::Action::Flow { flow },
-                    secondary: Some((copy_label, chk::Action::Copy { data })),
-                    ..
-                },
-            ..
-        } = &detail
-        else {
-            panic!("Saved contacts expose Share files and Copy name");
-        };
-        assert_eq!(copy_label, "Copy name");
-        assert_eq!(data, &peer().to_string());
-        let picker = page_description(flow.0[0].clone(), &mut ctx, &theme);
-        assert!(matches!(picker, PageType::Display { title, .. } if title == "Share files"));
-        let mut rendered = Page::Static(Box::new(detail)).build(&mut ctx, &theme, None, 1);
-        let visible = text(&draw(rendered.as_mut(), &mut ctx));
-        assert!(
-            visible
-                .split_whitespace()
-                .collect::<String>()
-                .contains(&peer().to_string())
-        );
-        assert!(
-            visible.contains("No shared files yet") && has_button_label(&visible, "Share files")
-        );
+        assert_profile_contact(&detail, peer());
+        assert!(list_titles(&detail).is_empty());
         assert_eq!(air.0.lock().unwrap().len(), before);
-        assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
-        assert!(ctx.air.instances::<Transfer>().list().is_empty());
-
+        let mut app = <FigFiles as prism::Application>::new(&mut ctx);
+        draw(&mut app, &mut ctx);
+        let after_startup = air.0.lock().unwrap().len();
+        browser::show(&mut ctx, &theme, Page::Static(Box::new(detail)));
+        tap_text(&mut app, &mut ctx, "Share Files");
+        assert!(text(&draw(&mut app, &mut ctx)).contains("Share files"));
+        assert!(air.1.lock().unwrap().is_none());
+        // Startup creates the user's own profile/library; contact rendering and
+        // the file picker must leave the selected contact's metadata untouched.
+        assert_eq!(profile.pending().username, "Alex Example");
+        assert_eq!(air.0.lock().unwrap().len(), after_startup);
         shared_fixture(&ctx, &air, false, true, MemberStatus::Active);
         transfer_fixture(&ctx, &air, false, false, true, TransferStatus::Accepted);
+        contacts_ui::sync_profiles(&mut ctx);
         let before = air.0.lock().unwrap().len();
         let home = page_description(contacts_ui::home(), &mut ctx, &theme);
-        let rows = page_body(&home)
-            .iter()
-            .filter_map(|item| match item {
-                Display::List { items, .. } => Some(items),
-                _ => None,
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            rows.len(),
-            1,
-            "Manual and sharing records for the same name merge into one contact"
+        assert_eq!(list_titles(&home), ["Alex Example"]);
+        let detail = page_description(contacts_ui::detail(peer()), &mut ctx, &theme);
+        let titles = list_titles(&detail);
+        assert!(
+            titles.contains(&"owned-folder".into()) && titles.contains(&"sent-note.txt".into())
         );
-        let mut rendered = contacts_ui::detail(peer()).build(&mut ctx, &theme, None, 1);
-        let visible = text(&draw(rendered.as_mut(), &mut ctx));
-        assert!(visible.contains("owned-folder") && visible.contains("sent-note.txt"));
-        assert!(visible.contains("2 shared items"));
-        assert_eq!(ctx.air.instances::<AddressBook>().list().len(), 1);
         assert_eq!(air.0.lock().unwrap().len(), before);
+        assert!(
+            ctx.air
+                .instances::<AddressBook>()
+                .list()
+                .values()
+                .all(|book| book.pending().contacts.is_empty())
+        );
+        assert!(air.1.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn legacy_contacts_migrate_privately_without_overwriting_profiles_or_adding_unaccepted_senders() {
+    let (mut ctx, air) = context_with_air(false);
+    let saved_name = air::Secret::new().name();
+    contacts::add(&ctx.air, saved_name).unwrap();
+    let mut profile = Profile::from_name(&mut ctx, saved_name);
+    profile.send(ProfileAction::ChangeUsername("My colleague".into()));
+    profile.send(ProfileAction::ChangeNotes("Private notes preserved".into()));
+    profile.send(ProfileAction::ChangeAvatar(chk::AvatarContent::icon(
+        Icons::Group,
+        chk::AvatarIconStyle::Brand,
+    )));
+    let custom = profile.pending().clone();
+    let outgoing = shared_fixture(&ctx, &air, false, true, MemberStatus::Active);
+    let unknown = air::Secret::new().name();
+    let mut pending = transfer_fixture(&ctx, &air, true, true, true, TransferStatus::Pending)
+        .pending()
+        .clone();
+    pending.sender = unknown;
+    stored_fixture(&ctx, &air, Id::random(), pending);
+    let mut invalid = transfer_fixture(&ctx, &air, false, false, true, TransferStatus::Accepted)
+        .pending()
+        .clone();
+    invalid.recipient = air::Secret::new().name();
+    let invalid_name = invalid.recipient;
+    invalid.items[0].name = "invalid/name".into();
+    stored_fixture(&ctx, &air, Id::random(), invalid);
+    let memberships = outgoing.pending().members.clone();
+    contacts_ui::sync_profiles(&mut ctx);
+    assert!(Profile::try_from_name(&mut ctx, peer()).is_some());
+    assert!(Profile::try_from_name(&mut ctx, unknown).is_none());
+    assert!(Profile::try_from_name(&mut ctx, invalid_name).is_none());
+    assert_eq!(*profile.pending(), custom);
+    let count = air.0.lock().unwrap().len();
+    contacts_ui::sync_profiles(&mut ctx);
+    assert_eq!(air.0.lock().unwrap().len(), count);
+    assert_eq!(*profile.pending(), custom);
+    assert_eq!(outgoing.pending().members, memberships);
+    assert!(ctx.air.instances::<ChatRoom>().list().is_empty());
+    assert!(ctx.air.instances::<Block>().list().is_empty());
+    assert!(air.1.lock().unwrap().is_none());
+}
+
+#[test]
+fn standard_profile_editing_saves_alias_biography_and_avatar_privately() {
+    for mobile in [true, false] {
+        let (mut ctx, air) = context_with_air(mobile);
+        let theme = theme();
+        let mut root = FigFiles.roots(&mut ctx, &theme, None).pop().unwrap();
+        assert_eq!(root.label, "Profile");
+        assert!(text(&draw(root.page.as_mut(), &mut ctx)).contains("My profile"));
+        let own_contact = page_description(contacts_ui::detail(me()), &mut ctx, &theme);
+        assert!(
+            matches!(own_contact, PageType::Edit { ref title, .. } if title == "My profile"),
+            "Selecting your own AirName opens your profile editor, not a self-sharing action"
+        );
+        let page = page_description(
+            chk::Root::profile(&mut ctx, &chk::ContactInvitations::default()).0,
+            &mut ctx,
+            &theme,
+        );
+        let PageType::Edit {
+            title,
+            items,
+            display,
+            mut on_save,
+            ..
+        } = page
+        else {
+            panic!("Profile reuses CHK's standard edit page");
+        };
+        assert_eq!(title, "My profile");
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["avatar", "username", "about"]
+        );
+        assert!(display.iter().any(|item| matches!(item, Display::Cta {label, instructions, ..} if label == "AirName" && instructions == &me().to_string())));
+        let records = air.0.lock().unwrap().len();
+        let avatar = chk::AvatarContent::icon(Icons::Profile, chk::AvatarIconStyle::Brand);
+        let values = chk::FormValues::new([
+            ("username".into(), chk::State::Text("My Fig Profile".into())),
+            (
+                "about".into(),
+                chk::State::Text("Personal biography".into()),
+            ),
+            ("avatar".into(), chk::State::Avatar(avatar.clone())),
+        ]);
+        on_save(&mut ctx, &values);
+        let profile = Profile::try_from_name(&mut ctx, me()).unwrap();
+        assert_eq!(profile.pending().username, "My Fig Profile");
+        assert_eq!(profile.pending().notes, "Personal biography");
+        assert_eq!(profile.pending().avatar, avatar);
+        assert_eq!(air.0.lock().unwrap().len(), records);
+        assert!(ctx.air.instances::<ChatRoom>().list().is_empty());
+        assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
         assert!(air.1.lock().unwrap().is_none());
     }
 }
@@ -1251,9 +1476,27 @@ fn sharing_again_with_a_contact_skips_name_entry_but_requires_explicit_confirmat
             let without_contact =
                 sharing_ui::picker_selection(&mut ctx, vault.clone(), id, None, &theme);
             let selector = page_description(without_contact.0[0].clone(), &mut ctx, &theme);
-            assert!(matches!(&selector, PageType::Form {
-                item: chk::Input::Search { items, .. }, ..
-            } if items.len() == 1));
+            assert!(matches!(
+                &selector,
+                PageType::Form {
+                    item: chk::Input::Selection(_),
+                    ..
+                }
+            ));
+            let mut selected_contact =
+                Page::Static(Box::new(selector.clone())).build(&mut ctx, &theme, None, 1);
+            let short = Profile::try_from_name(&mut ctx, peer())
+                .unwrap()
+                .pending()
+                .username
+                .clone();
+            assert_eq!(
+                text(&draw(selected_contact.as_mut(), &mut ctx))
+                    .lines()
+                    .filter(|line| *line == short)
+                    .count(),
+                1
+            );
             manual_recipient_page(selector, &mut ctx, &theme);
 
             let picker = page_description(sharing_ui::send_picker_for(peer()), &mut ctx, &theme);
@@ -1277,7 +1520,7 @@ fn sharing_again_with_a_contact_skips_name_entry_but_requires_explicit_confirmat
             let confirmation = page_description(selected.0[0].clone(), &mut ctx, &theme);
             assert_eq!(primary_label(&confirmation), Some("Share access"));
             assert!(
-                matches!(&confirmation, PageType::Display { .. }),
+                matches!(&confirmation, PageType::Content { .. }),
                 "Known recipients must not be asked for their name again"
             );
             let mut rendered =
@@ -1297,7 +1540,7 @@ fn sharing_again_with_a_contact_skips_name_entry_but_requires_explicit_confirmat
             // Explicit confirmation uses the same collaborative share action;
             // only the new SharedSpace capability leaves the private library.
             *air.1.lock().unwrap() = Some(Vec::new());
-            let PageType::Display {
+            let PageType::Content {
                 bumper: Bumper::Custom {
                     action, secondary, ..
                 },
@@ -1328,6 +1571,359 @@ fn sharing_again_with_a_contact_skips_name_entry_but_requires_explicit_confirmat
             assert!(ctx.air.instances::<Transfer>().list().is_empty());
         }
     }
+}
+
+#[test]
+fn header_search_filters_in_place_clears_and_opens_results() {
+    fn key(view: &mut dyn Drawable, ctx: &mut Context, key: prism::events::Key) -> String {
+        let layout = view.layout(ctx.window.size);
+        view.event(
+            ctx,
+            &layout,
+            Box::new(prism::events::KeyboardEvent {
+                key,
+                state: prism::events::KeyboardState::Pressed,
+                modifiers: prism::events::Modifiers::default(),
+            }),
+        );
+        text(&draw(view, ctx))
+    }
+
+    for mobile in [true, false] {
+        for mode in 0..3 {
+            let (mut ctx, air) = context_with_air(mobile);
+            let theme = theme();
+            let mut vault = storage::open(&ctx.air);
+            let mut space =
+                (mode == 1).then(|| shared_fixture(&ctx, &air, true, true, MemberStatus::Active));
+            let (source, matched, other, title) = if let Some(space) = &mut space {
+                let root = space.pending().root;
+                collaboration::import_file(&ctx.air, space, root, "other.txt", b"Other".to_vec())
+                    .unwrap();
+                (
+                    crate::collaboration_ui::item(space.clone(), root),
+                    "received-note.txt",
+                    "other.txt",
+                    "Search shared folder",
+                )
+            } else if mode == 2 {
+                let mut profile = Profile::from_name(&mut ctx, peer());
+                profile.send(ProfileAction::ChangeUsername("Note keeper".into()));
+                let mut other = Profile::from_name(&mut ctx, air::Secret::new().name());
+                other.send(ProfileAction::ChangeUsername("Morgan".into()));
+                (
+                    contacts_ui::home(),
+                    "Note keeper",
+                    "Morgan",
+                    "Search contacts",
+                )
+            } else {
+                storage::import_file(&ctx.air, &mut vault, None, "note.txt", b"Notes".to_vec())
+                    .unwrap();
+                storage::import_file(&ctx.air, &mut vault, None, "other.txt", b"Other".to_vec())
+                    .unwrap();
+                let trashed = storage::import_file(
+                    &ctx.air,
+                    &mut vault,
+                    None,
+                    "trashed-note.txt",
+                    b"Old".to_vec(),
+                )
+                .unwrap();
+                storage::trash(&mut vault, trashed).unwrap();
+                (
+                    browser::listing(vault.clone(), browser::Location::Folder(None), true),
+                    "note.txt",
+                    "other.txt",
+                    "Search files",
+                )
+            };
+            let header = match page_description(source, &mut ctx, &theme) {
+                PageType::Content { header, .. } => header,
+                _ => panic!("Search must be reachable from the page header"),
+            };
+            let mut search = match header {
+                chk::design_system::Header::Home {
+                    action: Some((Icons::Search, action)),
+                    ..
+                }
+                | chk::design_system::Header::Stack {
+                    action: Some((Icons::Search, action)),
+                    ..
+                } => action,
+                _ => panic!("Missing Search header action"),
+            };
+            let mut app = <FigFiles as prism::Application>::new(&mut ctx);
+            draw(&mut app, &mut ctx);
+            search(&mut ctx, &theme);
+            let visible = text(&draw(&mut app, &mut ctx));
+            assert!(
+                visible.contains(title) && visible.contains(matched) && visible.contains(other),
+                "{visible}"
+            );
+            assert!(!has_button_label(&visible, "Continue"));
+
+            let visible = key(
+                &mut app,
+                &mut ctx,
+                prism::events::Key::Character("note".into()),
+            );
+            assert!(
+                visible.contains(title) && visible.contains(matched),
+                "{visible}"
+            );
+            assert!(
+                !visible.contains(other) && !visible.contains("trashed-note.txt"),
+                "{visible}"
+            );
+            assert!(!has_button_label(&visible, "Continue"));
+
+            for _ in 0..4 {
+                key(&mut app, &mut ctx, prism::events::Key::Backspace);
+            }
+            let visible = text(&draw(&mut app, &mut ctx));
+            assert!(
+                visible.contains(matched) && visible.contains(other),
+                "Clearing restores all results: {visible}"
+            );
+            let visible = key(
+                &mut app,
+                &mut ctx,
+                prism::events::Key::Character("no-match".into()),
+            );
+            assert!(
+                visible.contains(if mode == 2 {
+                    "No matching contacts."
+                } else {
+                    "No matching files or folders."
+                }),
+                "{visible}"
+            );
+            for _ in 0..8 {
+                key(&mut app, &mut ctx, prism::events::Key::Backspace);
+            }
+            key(
+                &mut app,
+                &mut ctx,
+                prism::events::Key::Character("note".into()),
+            );
+            tap_text(&mut app, &mut ctx, matched);
+            let visible = text(&draw(&mut app, &mut ctx));
+            assert!(
+                !visible.contains(title),
+                "A result must open directly: {visible}"
+            );
+            if mode == 2 {
+                assert!(
+                    visible.contains("AirName") && has_button_label(&visible, "Share files"),
+                    "{visible}"
+                );
+                assert!(!has_button_label(&visible, "Message"));
+            } else {
+                assert!(visible.contains(matched), "{visible}");
+            }
+            assert!(ctx.air.instances::<ChatRoom>().list().is_empty());
+            assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+            assert!(air.1.lock().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn folder_header_search_contains_only_descendants_and_root_search_stays_global() {
+    fn search(page: Page, ctx: &mut Context, theme: &Theme) -> Box<dyn Drawable> {
+        let PageType::Content { header, .. } = page_description(page, ctx, theme) else {
+            panic!("A folder must expose its Search header");
+        };
+        let mut action = match header {
+            chk::design_system::Header::Home {
+                action: Some((Icons::Search, action)),
+                ..
+            }
+            | chk::design_system::Header::Stack {
+                action: Some((Icons::Search, action)),
+                ..
+            } => action,
+            _ => panic!("Missing Search header action"),
+        };
+        let mut app = <FigFiles as prism::Application>::new(ctx);
+        draw(&mut app, ctx);
+        action(ctx, theme);
+        draw(&mut app, ctx);
+        Box::new(app)
+    }
+    fn query(view: &mut dyn Drawable, ctx: &mut Context, previous: &str, next: &str) -> String {
+        use prism::events::{Key, KeyboardEvent, KeyboardState, Modifiers};
+        for key in std::iter::repeat_n(Key::Backspace, previous.len())
+            .chain(std::iter::once(Key::Character(next.into())))
+        {
+            let layout = view.layout(ctx.window.size);
+            view.event(
+                ctx,
+                &layout,
+                Box::new(KeyboardEvent {
+                    key,
+                    state: KeyboardState::Pressed,
+                    modifiers: Modifiers::default(),
+                }),
+            );
+            draw(view, ctx);
+        }
+        text(&draw(view, ctx))
+    }
+    let (mut ctx, air) = context_with_air(false);
+    let theme = theme();
+    let mut vault = storage::open(&ctx.air);
+    let parent = storage::create_folder(&mut vault, None, "Parent").unwrap();
+    let scope = storage::create_folder(&mut vault, Some(parent), "Working folder").unwrap();
+    let sibling = storage::create_folder(&mut vault, Some(parent), "Sibling").unwrap();
+    let deeper = storage::create_folder(&mut vault, Some(scope), "Private deeper").unwrap();
+    for (parent, name) in [
+        (Some(scope), "note-private-child.txt"),
+        (Some(deeper), "note-private-grandchild.txt"),
+        (None, "note-outside-root.txt"),
+        (Some(parent), "note-outside-parent.txt"),
+        (Some(sibling), "note-outside-sibling.txt"),
+    ] {
+        storage::import_file(&ctx.air, &mut vault, parent, name, b"Test".to_vec()).unwrap();
+    }
+    let discarded = storage::create_folder(&mut vault, Some(scope), "Discarded").unwrap();
+    storage::import_file(
+        &ctx.air,
+        &mut vault,
+        Some(discarded),
+        "note-trash-private.txt",
+        b"Old".to_vec(),
+    )
+    .unwrap();
+    storage::trash(&mut vault, discarded).unwrap();
+
+    let mut space = shared_fixture(&ctx, &air, true, true, MemberStatus::Active);
+    let root = space.pending().root;
+    let root_file = space.pending().tree.children(Some(root))[0].id;
+    collaboration::rename(&ctx.air, &mut space, root_file, "note-shared-parent.txt").unwrap();
+    let shared_scope =
+        collaboration::create_folder(&ctx.air, &mut space, root, "Shared scope").unwrap();
+    let shared_deeper =
+        collaboration::create_folder(&ctx.air, &mut space, shared_scope, "Shared deeper").unwrap();
+    let shared_sibling =
+        collaboration::create_folder(&ctx.air, &mut space, root, "Shared sibling").unwrap();
+    for (parent, name) in [
+        (shared_scope, "note-shared-child.txt"),
+        (shared_deeper, "note-shared-grandchild.txt"),
+        (shared_sibling, "note-shared-sibling.txt"),
+    ] {
+        collaboration::import_file(&ctx.air, &mut space, parent, name, b"Test".to_vec()).unwrap();
+    }
+    let discarded =
+        collaboration::create_folder(&ctx.air, &mut space, shared_scope, "Discarded shared")
+            .unwrap();
+    collaboration::import_file(
+        &ctx.air,
+        &mut space,
+        discarded,
+        "note-trash-shared.txt",
+        b"Old".to_vec(),
+    )
+    .unwrap();
+    collaboration::trash(&ctx.air, &mut space, discarded).unwrap();
+    let mount = storage::mount_shared(&mut vault, space.id(), "Mounted", true).unwrap();
+    storage::move_entry(&mut vault, mount, Some(scope)).unwrap();
+    let mut other_space = shared_fixture(&ctx, &air, false, true, MemberStatus::Active);
+    let other_root = other_space.pending().root;
+    let other_file = other_space.pending().tree.children(Some(other_root))[0].id;
+    collaboration::rename(
+        &ctx.air,
+        &mut other_space,
+        other_file,
+        "note-outside-mount.txt",
+    )
+    .unwrap();
+    let other_mount =
+        storage::mount_shared(&mut vault, other_space.id(), "Other mount", true).unwrap();
+    storage::move_entry(&mut vault, other_mount, Some(sibling)).unwrap();
+
+    let scoped = browser::listing(vault.clone(), browser::Location::Folder(Some(scope)), false);
+    // Folder identity, rather than its original name, defines the scope.
+    storage::rename(&mut vault, scope, "Renamed working folder").unwrap();
+    let mut view = search(scoped, &mut ctx, &theme);
+    let initial = text(&draw(view.as_mut(), &mut ctx));
+    assert!(
+        initial.contains("Private deeper") && !initial.contains("Sibling"),
+        "{initial}"
+    );
+    let visible = query(view.as_mut(), &mut ctx, "", "note-private");
+    assert!(
+        visible.contains("note-private-child.txt")
+            && visible.contains("note-private-grandchild.txt"),
+        "{visible}"
+    );
+    let visible = query(view.as_mut(), &mut ctx, "note-private", "note-shared");
+    for name in [
+        "note-shared-child.txt",
+        "note-shared-grandchild.txt",
+        "note-shared-parent.txt",
+        "note-shared-sibling.txt",
+    ] {
+        assert!(
+            visible.contains(name),
+            "Mounted descendants must be searched inside their private folder: {visible}"
+        );
+    }
+    let visible = query(view.as_mut(), &mut ctx, "note-shared", "note-outside");
+    assert!(
+        visible.contains("No matching files or folders."),
+        "{visible}"
+    );
+    let visible = query(view.as_mut(), &mut ctx, "note-outside", "note-trash");
+    assert!(
+        visible.contains("No matching files or folders."),
+        "{visible}"
+    );
+
+    let mut view = search(
+        crate::collaboration_ui::item(space.clone(), shared_scope),
+        &mut ctx,
+        &theme,
+    );
+    let initial = text(&draw(view.as_mut(), &mut ctx));
+    assert!(
+        initial.contains("Shared deeper") && !initial.contains("Shared sibling"),
+        "{initial}"
+    );
+    let visible = query(view.as_mut(), &mut ctx, "", "note-shared");
+    assert!(
+        visible.contains("note-shared-child.txt") && visible.contains("note-shared-grandchild.txt"),
+        "{visible}"
+    );
+    assert!(
+        !visible.contains("note-shared-parent.txt") && !visible.contains("note-shared-sibling.txt"),
+        "{visible}"
+    );
+    let visible = query(view.as_mut(), &mut ctx, "note-shared", "note-trash");
+    assert!(
+        visible.contains("No matching files or folders."),
+        "{visible}"
+    );
+
+    let mut view = search(
+        browser::listing(vault.clone(), browser::Location::Folder(None), true),
+        &mut ctx,
+        &theme,
+    );
+    let visible = query(view.as_mut(), &mut ctx, "", "note-outside");
+    for name in [
+        "note-outside-root.txt",
+        "note-outside-parent.txt",
+        "note-outside-sibling.txt",
+        "note-outside-mount.txt",
+    ] {
+        assert!(
+            visible.contains(name),
+            "Files root must retain global search: {visible}"
+        );
+    }
+    assert!(air.1.lock().unwrap().is_none());
 }
 
 #[test]
@@ -1371,7 +1967,7 @@ fn populated_folders_search_and_trash_render_actual_entries() {
         }
         let mut page = browser::info(vault.clone(), file).build(&mut ctx, &theme(), None, 1);
         let visible = text(&draw(page.as_mut(), &mut ctx));
-        for expected in ["notes.txt", "Share", "Delete", "Manage file"] {
+        for expected in ["notes.txt", "Share", "Move", "Delete"] {
             assert!(
                 visible.contains(expected),
                 "File details should include {expected}: {visible}"
@@ -1438,7 +2034,10 @@ fn library_commands_are_scoped_to_folders_and_totals_are_the_last_content() {
                     &mut ctx,
                     &theme,
                 );
-                assert_eq!(primary_label(&page), is_folder.then_some("Add files"));
+                assert_eq!(
+                    primary_label(&page),
+                    is_folder.then_some(if root { "Add Files" } else { "Add files" }),
+                );
                 let body = page_body(&page);
                 assert!(
                     !body
@@ -1458,17 +2057,24 @@ fn library_commands_are_scoped_to_folders_and_totals_are_the_last_content() {
                     "Trashed content must be excluded from library bytes: {text}"
                 );
                 let header = match &page {
-                    PageType::Root {
-                        header, bumper_b, ..
+                    PageType::Content {
+                        header,
+                        bumper: Bumper::Footer(chk::design_system::Footer::Home { second, .. }),
+                        ..
                     } => {
-                        assert!(bumper_b.is_none());
+                        assert!(second.is_none());
                         header
                     }
-                    PageType::Display { header, .. } => header,
+                    PageType::Content { header, .. } => header,
                     _ => unreachable!(),
                 };
                 assert_eq!(
-                    header.as_ref().map(|(icon, _)| *icon),
+                    match header {
+                        chk::design_system::Header::Stack { action, .. }
+                        | chk::design_system::Header::Home { action, .. } =>
+                            action.as_ref().map(|(icon, _)| *icon),
+                        _ => None,
+                    },
                     (!is_trash).then_some(Icons::Search)
                 );
             }
@@ -1507,7 +2113,6 @@ fn collaborative_browser_open_folder_switches_to_live_contents_after_promotion()
         let visible = text(&draw(after.as_mut(), &mut ctx));
         for expected in [
             "notes.txt",
-            "Everyone who joins can read and edit",
             "Shared Trash",
             "2 items · 3 B in this shared folder",
         ] {
@@ -1523,7 +2128,7 @@ fn collaborative_browser_open_folder_switches_to_live_contents_after_promotion()
             &mut ctx,
             &theme,
         );
-        let PageType::Display {
+        let PageType::Content {
             bumper: Bumper::Custom { action, .. },
             ..
         } = add
@@ -1579,7 +2184,7 @@ fn collaborative_browser_search_follows_shared_edits_and_keeps_totals_last() {
         collaboration::trash(&ctx.air, &mut space, child).unwrap();
         let page = page_description(search, &mut ctx, &theme);
         assert_eq!(primary_label(&page), None);
-        let Some(Display::Text { text: footer, .. }) = page_body(&page).last() else {
+        let Some(Display::Text { text: footer, .. }) = page_body(&page).into_iter().last() else {
             panic!("Totals belong last");
         };
         assert!(
@@ -1625,13 +2230,16 @@ fn collaborative_browser_private_move_excludes_shared_shortcuts() {
         };
         assert_eq!(
             items,
-            vec![chk::EnumItem::new("Files / Personal", "Folder")]
+            vec![chk::ValueItem::new("Files / Personal", "Folder")]
         );
         let mut rendered = Page::Static(Box::new(page)).build(&mut ctx, &theme, None, 1);
         let visible = text(&draw(rendered.as_mut(), &mut ctx));
         assert!(visible.contains("Files / Personal"));
         assert!(!visible.contains("Shared destination"));
-        submit(&mut ctx, &vec![chk::State::Enumerator(0)]);
+        submit(
+            &mut ctx,
+            &form_value("destination", chk::State::Enumerator(0)),
+        );
         assert_eq!(vault.pending().get(file).unwrap().parent, Some(personal));
         assert_eq!(space.pending().tree, before);
         assert!(air.1.lock().unwrap().is_none());
@@ -1669,10 +2277,12 @@ fn collaborative_browser_share_picker_uses_live_names_but_shares_the_private_mou
             panic!("The manual-entry bumper opens recipient input");
         };
         let recipient = ::air::Secret::new().name();
-        // CHK's Form::flow executes Next and returns None from its wrapper.
-        // Inspect the same app-owned destination without relying on private
-        // navigation event types or invoking any sharing during construction.
-        submit(&mut ctx, &vec![chk::State::Text(recipient.to_string())]);
+        // Saving the receiving name prepares the selection; sharing still
+        // requires the explicit app-owned confirmation below.
+        submit(
+            &mut ctx,
+            &form_value("airname", chk::State::Text(recipient.to_string())),
+        );
         assert!(air.1.lock().unwrap().is_none());
         let confirmation = sharing_ui::send_confirmation(vault.clone(), mount, recipient);
         collaboration::rename(&ctx.air, &mut space, root, "Latest project name").unwrap();
@@ -1684,7 +2294,7 @@ fn collaborative_browser_share_picker_uses_live_names_but_shares_the_private_mou
             air.1.lock().unwrap().is_none(),
             "Rendering must not invite anyone"
         );
-        let PageType::Display {
+        let PageType::Content {
             bumper: Bumper::Custom { action, .. },
             ..
         } = page
@@ -1710,7 +2320,7 @@ fn collaborative_browser_share_picker_uses_live_names_but_shares_the_private_mou
 }
 
 #[test]
-fn file_preview_opens_info_with_metadata_and_focused_action_rows() {
+fn file_preview_opens_info_with_metadata_and_focused_actions() {
     for mobile in [true, false] {
         let mut ctx = context(mobile);
         let theme = theme();
@@ -1732,29 +2342,19 @@ fn file_preview_opens_info_with_metadata_and_focused_action_rows() {
         assert_eq!(primary_label(&file_page), None);
         assert!(
             !page_body(&file_page)
-                .iter()
+                .into_iter()
                 .any(|display| matches!(display, Display::Actions { .. }))
         );
         let (icon, info) = header_description(file_page, &mut ctx, &theme);
         assert_eq!(icon, Icons::Info);
-        assert_eq!(primary_label(&info), None);
-        let rows: Vec<_> = page_body(&info)
-            .iter()
-            .filter_map(|display| match display {
-                Display::List { items, .. } => Some(items),
-                _ => None,
-            })
-            .flatten()
-            .map(|item| item.title.as_str())
-            .collect();
-        for expected in ["Share", "Delete", "Manage file", "Export file"] {
+        assert!(!has_button_label(&info, "Continue"));
+        for expected in ["Share", "Move", "Delete", "Export file"] {
             assert!(
-                rows.contains(&expected),
+                has_button_label(&info, expected),
                 "Missing file information action {expected}"
             );
         }
-        let mut rendered = Page::Static(Box::new(info)).build(&mut ctx, &theme, None, 1);
-        let visible = text(&draw(rendered.as_mut(), &mut ctx));
+        let visible = info;
         for expected in ["Name", "Kind", "Size", "Location", "Access", "Only you"] {
             assert!(
                 visible.contains(expected),
@@ -1763,26 +2363,25 @@ fn file_preview_opens_info_with_metadata_and_focused_action_rows() {
         }
 
         let folder_page = page_description(browser::info(vault.clone(), folder), &mut ctx, &theme);
-        assert_eq!(primary_label(&folder_page), Some("Share folder"));
-        let (icon, management) = header_description(folder_page, &mut ctx, &theme);
-        assert_eq!(icon, Icons::Settings);
-        assert_eq!(primary_label(&management), None);
-
-        let manage = page_description(browser::manage_page(vault.clone(), file), &mut ctx, &theme);
-        assert_eq!(primary_label(&manage), None);
-        assert!(
-            !page_body(&manage)
-                .iter()
-                .any(|display| matches!(display, Display::Actions { .. }))
+        assert_eq!(primary_label(&folder_page), None);
+        assert_eq!(
+            cta_action_labels(&folder_page),
+            vec!["Share", "Move", "Delete"]
         );
-        let mut rendered = Page::Static(Box::new(manage.clone())).build(&mut ctx, &theme, None, 1);
-        let visible = text(&draw(rendered.as_mut(), &mut ctx));
-        for expected in ["Rename", "Move"] {
-            assert!(visible.contains(expected), "Missing {expected}: {visible}");
-        }
-        let (icon, confirmation) = header_description(manage, &mut ctx, &theme);
-        assert_eq!(icon, Icons::Delete);
-        assert_eq!(primary_label(&confirmation), Some("Move to Trash"));
+        let (icon, rename) = header_description(folder_page, &mut ctx, &theme);
+        assert_eq!(icon, Icons::Edit);
+        assert!(rename.contains("Edit folder") && rename.contains("Folder name"));
+        assert!(has_button_label(&rename, "Save"));
+        assert!(!has_button_label(&rename, "Continue"));
+        assert!(!rename.contains("Manage item"));
+
+        let file_info = page_description(browser::info(vault.clone(), file), &mut ctx, &theme);
+        assert_eq!(primary_label(&file_info), None);
+        let (icon, rename) = header_description(file_info, &mut ctx, &theme);
+        assert_eq!(icon, Icons::Edit);
+        assert!(rename.contains("Edit file") && rename.contains("File name"));
+        assert!(has_button_label(&rename, "Save"));
+        assert!(!has_button_label(&rename, "Continue"));
         assert_eq!(
             vault.pending().entries,
             before,
@@ -1795,7 +2394,7 @@ fn file_preview_opens_info_with_metadata_and_focused_action_rows() {
         assert_eq!(primary_label(&trashed), Some("Restore"));
         let (icon, confirmation) = header_description(trashed, &mut ctx, &theme);
         assert_eq!(icon, Icons::Delete);
-        assert_eq!(primary_label(&confirmation), Some("Delete permanently"));
+        assert!(has_button_label(&confirmation, "Delete permanently"));
         assert!(
             vault.pending().get(file).is_some(),
             "Opening confirmation must not delete the item"
@@ -1836,10 +2435,10 @@ fn opening_private_text_and_images_automatically_loads_content_with_an_info_head
             let mut rendered = Page::Static(Box::new(loading)).build(&mut ctx, &theme, None, 1);
             assert!(text(&draw(rendered.as_mut(), &mut ctx)).contains("Loading preview"));
             let ready = wait_for_preview(builder.as_mut(), &mut ctx, &theme);
-            assert_eq!(matches!(&ready, PageType::Photo { .. }), image);
+            assert_eq!(matches!(&ready, PageType::EdgeToEdge { .. }), image);
             let (icon, info) = header_description(ready.clone(), &mut ctx, &theme);
             assert_eq!(icon, Icons::Info);
-            assert_eq!(primary_label(&info), None);
+            assert!(!has_button_label(&info, "Continue"));
             let mut rendered = Page::Static(Box::new(ready)).build(&mut ctx, &theme, None, 1);
             let visible = text(&draw(rendered.as_mut(), &mut ctx));
             if !image {
@@ -1858,7 +2457,11 @@ fn opening_private_text_and_images_automatically_loads_content_with_an_info_head
 fn native_pdf_info_page_selection_reopens_the_automatic_preview() {
     fn tap_info(view: &mut dyn Drawable, ctx: &mut Context, theme: &Theme) {
         use prism::events::{MouseButton, MouseEvent, MouseState};
-        let icon = theme.icons().get(Icons::Info);
+        let native = theme
+            .downcast_ref::<chk::PelicanUi>()
+            .unwrap()
+            .native_theme();
+        let icon = native.icons().get(Icons::Info);
         let drawing = draw(view, ctx);
         let at = drawing
             .iter()
@@ -1903,10 +2506,10 @@ fn native_pdf_info_page_selection_reopens_the_automatic_preview() {
         };
         assert!(is_loading_preview(&builder.build(&mut ctx, &theme)));
         let ready = wait_for_preview(builder.as_mut(), &mut ctx, &theme);
-        assert!(matches!(&ready, PageType::Photo { .. }));
+        assert!(matches!(&ready, PageType::EdgeToEdge { .. }));
         assert_eq!(header_description(ready, &mut ctx, &theme).0, Icons::Info);
 
-        let mut app = FigFiles::new(&mut ctx);
+        let mut app = <FigFiles as prism::Application>::new(&mut ctx);
         draw(&mut app, &mut ctx);
         browser::show(&mut ctx, &theme, Page::Refreshing(builder));
         assert!(
@@ -1999,8 +2602,7 @@ fn asynchronous_shared_preview_rechecks_the_current_bytes_before_showing_a_resul
             !visible.contains("Collaborative content"),
             "An old worker result must not overwrite newer content"
         );
-        let mut rendered = Page::Static(Box::new(info)).build(&mut ctx, &theme, None, 1);
-        let visible = text(&draw(rendered.as_mut(), &mut ctx));
+        let visible = info;
         for label in [
             "Name", "Kind", "Size", "Location", "Access", "Share", "Delete",
         ] {
@@ -2113,16 +2715,27 @@ fn a_preview_finishing_after_trash_or_deletion_does_not_show_stale_file_contents
 }
 
 #[test]
-fn file_info_share_delete_and_export_rows_navigate_without_performing_the_action() {
+fn file_info_ctas_navigate_without_mutation_and_header_rename_requires_save() {
     for mobile in [true, false] {
-        for shared in [false, true] {
+        for mode in 0..3 {
+            let shared = mode != 0;
             let (mut ctx, air) = context_with_air(mobile);
             let theme = theme();
             let mut vault = storage::open(&ctx.air);
-            let space =
-                shared.then(|| shared_fixture(&ctx, &air, true, true, MemberStatus::Active));
-            let id = if let Some(space) = &space {
-                space.pending().tree.children(Some(space.pending().root))[0].id
+            storage::create_folder(&mut vault, None, "Destination").unwrap();
+            let mut space =
+                shared.then(|| shared_fixture(&ctx, &air, true, mode == 1, MemberStatus::Active));
+            let id = if let Some(space) = &mut space {
+                collaboration::join(&ctx.air, &mut vault, space).unwrap();
+                let root = space.pending().root;
+                if mode == 1 {
+                    let file = space.pending().tree.children(Some(root))[0].id;
+                    collaboration::create_folder(&ctx.air, space, root, "Shared destination")
+                        .unwrap();
+                    file
+                } else {
+                    root
+                }
             } else {
                 storage::import_file(
                     &ctx.air,
@@ -2141,7 +2754,34 @@ fn file_info_share_delete_and_export_rows_navigate_without_performing_the_action
             let before_vault = vault.pending().entries.clone();
             let before_shared = space.as_ref().map(|space| space.pending().tree.clone());
             let before_members = space.as_ref().map(|space| space.pending().members.clone());
-            let mut app = FigFiles::new(&mut ctx);
+            let original_name = space
+                .as_ref()
+                .map(|space| space.pending().tree.get(id).unwrap().name.clone())
+                .unwrap_or_else(|| vault.pending().get(id).unwrap().name.clone());
+            let page = page_description(info.clone(), &mut ctx, &theme);
+            let mut expected = vec!["Share", "Move", "Delete"];
+            if shared {
+                expected.push("File contents");
+            }
+            expected.push("Export file");
+            assert_eq!(cta_action_labels(&page), expected);
+            assert!(
+                list_titles(&page).is_empty(),
+                "File actions belong in CHK CTAs"
+            );
+            assert_eq!(primary_label(&page), None);
+            let PageType::Content {
+                header:
+                    chk::design_system::Header::Stack {
+                        action: Some((Icons::Edit, mut rename)),
+                        ..
+                    },
+                ..
+            } = page
+            else {
+                panic!("A file's Edit header must open its rename form directly");
+            };
+            let mut app = <FigFiles as prism::Application>::new(&mut ctx);
             draw(&mut app, &mut ctx);
             browser::show(&mut ctx, &theme, info.clone());
             tap_text(&mut app, &mut ctx, "Share");
@@ -2154,13 +2794,35 @@ fn file_info_share_delete_and_export_rows_navigate_without_performing_the_action
             assert!(air.1.lock().unwrap().is_none());
 
             browser::show(&mut ctx, &theme, info.clone());
+            tap_text(&mut app, &mut ctx, "Move");
+            let visible = text(&draw(&mut app, &mut ctx));
+            assert!(
+                visible.contains(if mode == 1 {
+                    "Shared destination"
+                } else {
+                    "Files / Destination"
+                }),
+                "{visible}"
+            );
+            assert_eq!(vault.pending().entries, before_vault);
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().tree.clone()), before_shared);
+            }
+
+            browser::show(&mut ctx, &theme, info.clone());
             tap_text(&mut app, &mut ctx, "Delete");
             let visible = text(&draw(&mut app, &mut ctx));
-            assert!(visible.contains(if shared {
-                "Move to Shared Trash"
-            } else {
-                "Move to Trash"
-            }));
+            assert!(
+                has_button_label(
+                    &visible,
+                    match mode {
+                        0 => "Move to Trash",
+                        1 => "Move to Shared Trash",
+                        _ => "Remove shortcut",
+                    }
+                ),
+                "{visible}"
+            );
             assert!(visible.contains("Cancel"));
             assert_eq!(vault.pending().entries, before_vault);
             if let Some(space) = &space {
@@ -2168,19 +2830,101 @@ fn file_info_share_delete_and_export_rows_navigate_without_performing_the_action
             }
             assert!(air.1.lock().unwrap().is_none());
 
+            if shared {
+                browser::show(&mut ctx, &theme, info.clone());
+                let visible = text(&draw(&mut app, &mut ctx));
+                assert!(
+                    has_button_label(&visible, "Edit text")
+                        && has_button_label(&visible, "Replace file"),
+                    "{visible}"
+                );
+                tap_text(&mut app, &mut ctx, "Edit text");
+                let visible = text(&draw(&mut app, &mut ctx));
+                assert!(
+                    visible.contains("Edit shared text")
+                        && visible.contains("Collaborative content"),
+                    "{visible}"
+                );
+                assert_eq!(
+                    Some(space.as_ref().unwrap().pending().tree.clone()),
+                    before_shared
+                );
+                assert!(drafts::list(&ctx.air).is_empty());
+            }
+
             browser::show(&mut ctx, &theme, info);
+            draw(&mut app, &mut ctx);
+            let layout = app.layout(ctx.window.size);
+            let center = (ctx.window.size.0 * 0.5, ctx.window.size.1 * 0.5);
+            app.event(
+                &mut ctx,
+                &layout,
+                Box::new(prism::events::MouseEvent {
+                    position: Some(center),
+                    state: prism::events::MouseState::Scroll(0.0, 300.0),
+                }),
+            );
+            draw(&mut app, &mut ctx);
             tap_text(&mut app, &mut ctx, "Export file");
             let visible = text(&draw(&mut app, &mut ctx));
             assert!(visible.contains("Export file"));
             assert!(
-                !visible.contains("Manage file"),
-                "Export row opens a focused confirmation"
+                !visible.contains("File contents"),
+                "Export CTA opens a focused confirmation: {visible}"
             );
             assert_eq!(vault.pending().entries, before_vault);
             if let Some(space) = &space {
                 assert_eq!(Some(space.pending().tree.clone()), before_shared);
             }
             assert!(air.1.lock().unwrap().is_none());
+
+            // Exercise the captured Edit header in a fresh navigation surface;
+            // prior scrolling/export navigation must not retain its focus.
+            let mut app = <FigFiles as prism::Application>::new(&mut ctx);
+            draw(&mut app, &mut ctx);
+            rename(&mut ctx, &theme);
+            let visible = text(&draw(&mut app, &mut ctx));
+            assert!(
+                visible.contains("Edit file") && visible.contains("File name"),
+                "{visible}"
+            );
+            assert!(has_button_label(&visible, "Save"));
+            assert!(!has_button_label(&visible, "Continue"));
+            tap_text(&mut app, &mut ctx, &original_name);
+            let layout = app.layout(ctx.window.size);
+            app.event(
+                &mut ctx,
+                &layout,
+                Box::new(prism::events::KeyboardEvent {
+                    key: prism::events::Key::Character("Renamed".into()),
+                    state: prism::events::KeyboardState::Pressed,
+                    modifiers: prism::events::Modifiers::default(),
+                }),
+            );
+            let typed = text(&draw(&mut app, &mut ctx));
+            assert!(
+                typed.contains("Renamed"),
+                "Renaming must edit the focused File name: {typed}"
+            );
+            assert_eq!(vault.pending().entries, before_vault);
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().tree.clone()), before_shared);
+            }
+            tap_text(&mut app, &mut ctx, "Save");
+            assert!(text(&draw(&mut app, &mut ctx)).contains("Edit file"));
+            let renamed = space
+                .as_ref()
+                .map(|space| space.pending().tree.get(id).unwrap().name.clone())
+                .unwrap_or_else(|| vault.pending().get(id).unwrap().name.clone());
+            assert_ne!(renamed, original_name);
+            assert!(renamed.contains("Renamed"));
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().members.clone()), before_members);
+                assert_eq!(
+                    space.pending().read_file(id).unwrap(),
+                    b"Collaborative content"
+                );
+            }
         }
     }
 }
@@ -2200,30 +2944,198 @@ fn add_and_folder_info_pages_keep_secondary_choices_separate_without_side_effect
     assert_eq!(primary_label(&add), Some("Import files"));
     assert!(
         !page_body(&add)
-            .iter()
+            .into_iter()
             .any(|display| matches!(display, Display::Actions { .. }))
     );
     let mut rendered = Page::Static(Box::new(add)).build(&mut ctx, &theme, None, 1);
     let visible = text(&draw(rendered.as_mut(), &mut ctx));
     assert!(visible.contains("New folder"));
 
-    let share = page_description(browser::info(vault.clone(), folder), &mut ctx, &theme);
-    let PageType::Display {
-        bumper: Bumper::Custom {
-            label, secondary, ..
-        },
-        ..
-    } = share
-    else {
-        panic!("Folder sharing needs a CHK bumper");
-    };
-    assert_eq!(label, "Share folder");
-    assert!(
-        secondary.is_none(),
-        "A folder cannot use the file export command"
+    let folder_info = page_description(browser::info(vault.clone(), folder), &mut ctx, &theme);
+    assert_eq!(primary_label(&folder_info), None);
+    assert_eq!(
+        cta_action_labels(&folder_info),
+        vec!["Share", "Move", "Delete"]
     );
+    let (icon, rename) = header_description(folder_info, &mut ctx, &theme);
+    assert_eq!(icon, Icons::Edit);
+    assert!(rename.contains("Edit folder") && rename.contains("Folder name"));
+    assert!(has_button_label(&rename, "Save"));
+    assert!(!has_button_label(&rename, "Continue"));
     assert_eq!(vault.pending().entries, before);
     assert!(ctx.air.instances::<Transfer>().list().is_empty());
+}
+
+#[test]
+fn folder_details_offer_direct_actions_and_preserve_shared_root_contents() {
+    fn edit_key(view: &mut dyn Drawable, ctx: &mut Context, key: prism::events::Key) {
+        let layout = view.layout(ctx.window.size);
+        view.event(
+            ctx,
+            &layout,
+            Box::new(prism::events::KeyboardEvent {
+                key,
+                state: prism::events::KeyboardState::Pressed,
+                modifiers: prism::events::Modifiers::default(),
+            }),
+        );
+        draw(view, ctx);
+    }
+    for mobile in [true, false] {
+        for mode in 0..3 {
+            let (mut ctx, air) = context_with_air(mobile);
+            let theme = theme();
+            let mut vault = storage::open(&ctx.air);
+            storage::create_folder(&mut vault, None, "Destination").unwrap();
+            let mut space =
+                (mode != 0).then(|| shared_fixture(&ctx, &air, true, true, MemberStatus::Active));
+            let mut shortcut = None;
+            let id = if let Some(space) = &mut space {
+                shortcut = Some(collaboration::join(&ctx.air, &mut vault, space).unwrap());
+                let root = space.pending().root;
+                collaboration::create_folder(&ctx.air, space, root, "Shared destination").unwrap();
+                if mode == 1 {
+                    collaboration::create_folder(&ctx.air, space, root, "Nested folder").unwrap()
+                } else {
+                    root
+                }
+            } else {
+                storage::create_folder(&mut vault, None, "Working folder").unwrap()
+            };
+            let info = || match &space {
+                Some(space) => crate::collaboration_ui::details(space.clone(), id),
+                None => browser::info(vault.clone(), id),
+            };
+            let original_name = space
+                .as_ref()
+                .map(|space| space.pending().tree.get(id).unwrap().name.clone())
+                .unwrap_or_else(|| vault.pending().get(id).unwrap().name.clone());
+            let before_vault = vault.pending().entries.clone();
+            let before_shared = space.as_ref().map(|space| space.pending().tree.clone());
+            let before_members = space.as_ref().map(|space| space.pending().members.clone());
+            let page = page_description(info(), &mut ctx, &theme);
+            assert_eq!(primary_label(&page), None);
+            assert_eq!(cta_action_labels(&page), ["Share", "Move", "Delete"]);
+            let PageType::Content {
+                header:
+                    chk::design_system::Header::Stack {
+                        action: Some((Icons::Edit, mut rename)),
+                        ..
+                    },
+                ..
+            } = page
+            else {
+                panic!("A folder's header must rename it directly");
+            };
+            let mut app = <FigFiles as prism::Application>::new(&mut ctx);
+            draw(&mut app, &mut ctx);
+            browser::show(&mut ctx, &theme, info());
+            tap_text(&mut app, &mut ctx, "Share");
+            let visible = text(&draw(&mut app, &mut ctx));
+            assert!(visible.contains("Share access"));
+            assert!(!visible.contains("No items yet"));
+            assert_eq!(vault.pending().entries, before_vault);
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().tree.clone()), before_shared);
+                assert_eq!(Some(space.pending().members.clone()), before_members);
+            }
+            assert!(air.1.lock().unwrap().is_none());
+
+            browser::show(&mut ctx, &theme, info());
+            tap_text(&mut app, &mut ctx, "Move");
+            let visible = text(&draw(&mut app, &mut ctx));
+            assert!(visible.contains(if mode == 1 {
+                "Shared destination"
+            } else {
+                "Files / Destination"
+            }));
+            assert_eq!(vault.pending().entries, before_vault);
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().tree.clone()), before_shared);
+            }
+
+            rename(&mut ctx, &theme);
+            let visible = text(&draw(&mut app, &mut ctx));
+            assert!(visible.contains("Edit folder") && visible.contains("Folder name"));
+            assert!(has_button_label(&visible, "Save"));
+            assert!(!has_button_label(&visible, "Continue"));
+            // An unchanged edit cannot save, and invalid input keeps the
+            // editor/draft open without mutating either private or shared data.
+            tap_text(&mut app, &mut ctx, "Save");
+            assert_eq!(vault.pending().entries, before_vault);
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().tree.clone()), before_shared);
+            }
+            tap_text(&mut app, &mut ctx, &original_name);
+            edit_key(
+                &mut app,
+                &mut ctx,
+                prism::events::Key::Character("/".into()),
+            );
+            assert!(text(&draw(&mut app, &mut ctx)).contains("Edit folder"));
+            assert_eq!(vault.pending().entries, before_vault);
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().tree.clone()), before_shared);
+            }
+            edit_key(&mut app, &mut ctx, prism::events::Key::Backspace);
+            edit_key(
+                &mut app,
+                &mut ctx,
+                prism::events::Key::Character("Renamed".into()),
+            );
+            assert_eq!(vault.pending().entries, before_vault);
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().tree.clone()), before_shared);
+            }
+            tap_text(&mut app, &mut ctx, "Save");
+            let saved_editor = text(&draw(&mut app, &mut ctx));
+            assert!(
+                saved_editor.contains("Edit folder"),
+                "Saving keeps the standard editor open"
+            );
+            assert!(!has_button_label(&saved_editor, "Continue"));
+            let renamed = space
+                .as_ref()
+                .map(|space| space.pending().tree.get(id).unwrap().name.clone())
+                .unwrap_or_else(|| vault.pending().get(id).unwrap().name.clone());
+            assert_ne!(renamed, original_name);
+            assert!(renamed.contains("Renamed"));
+
+            let before_delete_vault = vault.pending().entries.clone();
+            let before_delete_shared = space.as_ref().map(|space| space.pending().tree.clone());
+            browser::show(&mut ctx, &theme, info());
+            tap_text(&mut app, &mut ctx, "Delete");
+            let visible = text(&draw(&mut app, &mut ctx));
+            let confirm = match mode {
+                0 => "Move to Trash",
+                1 => "Move to Shared Trash",
+                _ => "Remove shortcut",
+            };
+            assert!(has_button_label(&visible, confirm));
+            assert!(has_button_label(&visible, "Cancel"));
+            assert_eq!(vault.pending().entries, before_delete_vault);
+            if let Some(space) = &space {
+                assert_eq!(Some(space.pending().tree.clone()), before_delete_shared);
+            }
+            tap_text(&mut app, &mut ctx, confirm);
+            draw(&mut app, &mut ctx);
+            if let Some(space) = &space {
+                assert!(!space.pending().tree.is_trashed(space.pending().root));
+                assert_eq!(Some(space.pending().members.clone()), before_members);
+                if mode == 1 {
+                    assert!(space.pending().tree.is_trashed(id));
+                    assert_eq!(vault.pending().entries, before_delete_vault);
+                } else {
+                    assert_eq!(Some(space.pending().tree.clone()), before_delete_shared);
+                    assert!(vault.pending().is_trashed(shortcut.unwrap()));
+                }
+            } else {
+                assert!(vault.pending().is_trashed(id));
+            }
+            assert!(air.1.lock().unwrap().is_none());
+            assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+        }
+    }
 }
 
 #[test]
@@ -2233,21 +3145,21 @@ fn empty_shared_root_and_receiving_name_render_on_phone_and_desktop_without_shar
         let theme = theme();
         let mut page = sharing_ui::home().build_root(&mut ctx, &theme);
         let visible = text(&draw(page.as_mut(), &mut ctx));
-        for expected in [
-            "Shared",
-            "Send",
-            "Receive",
-            "Files and folders you share or receive will appear here.",
-        ] {
+        for expected in ["Shared", "Send", "Receive", "No shared files yet."] {
             assert!(visible.contains(expected), "Missing {expected}: {visible}");
         }
         let mut page = sharing_ui::receive_name(me()).build(&mut ctx, &theme, None, 1);
         let visible = text(&draw(page.as_mut(), &mut ctx));
-        assert!(visible.contains("Receive files"));
-        assert!(has_button_label(&visible, "Copy name"));
-        // Wrapping may split the public key across drawing instructions.
-        let compact = visible.split_whitespace().collect::<String>();
-        assert!(compact.contains(&me().to_string()));
+        assert!(
+            visible.contains("Share AirName") && visible.contains("Scan to share this AirName.")
+        );
+        assert!(has_button_label(&visible, "Share"));
+        let description = page_description(sharing_ui::receive_name(me()), &mut ctx, &theme);
+        assert!(
+            page_body(&description).into_iter().any(
+                |item| matches!(item, Display::QRCode {data, ..} if data == &Invitation::Contact(me()).url())
+            )
+        );
         assert!(ctx.air.instances::<Transfer>().list().is_empty());
     }
 }
@@ -2274,32 +3186,50 @@ fn shared_send_and_receive_bumpers_open_their_flows_without_side_effects() {
             let vault_count = ctx.air.instances::<Vault>().list().len();
             let home = page_description(sharing_ui::home(), &mut ctx, &theme);
             assert_eq!(primary_label(&home), Some("Send"));
-            let PageType::Root {
-                header,
-                bumper_a: Some((send_label, mut send)),
-                bumper_b: Some((receive_label, mut receive)),
+            let PageType::Content {
+                header: chk::design_system::Header::Home { action: None, .. },
+                bumper:
+                    Bumper::Footer(chk::design_system::Footer::Home {
+                        first: Some((send_label, mut send)),
+                        second: Some((receive_label, mut receive)),
+                    }),
                 ..
             } = home
             else {
                 panic!("Shared needs labeled Send and Receive root bumpers");
             };
-            assert!(header.is_none());
             assert_eq!(send_label, "Send");
             assert_eq!(receive_label, "Receive");
-            let send_flow = send(&mut ctx, &theme);
-            assert_eq!(send_flow.0.len(), 1);
-            let picker = page_description(send_flow.0[0].clone(), &mut ctx, &theme);
+            let root = PageType::display("Test", vec![], None, Bumper::None, chk::Offset::Start)
+                .build_root(&mut ctx, &theme);
+            let mut interface = theme.interface(
+                &mut ctx,
+                vec![chk::RootInfo {
+                    icon: chk::RootIcon::Icon(Icons::Info),
+                    label: "Test".into(),
+                    page: root,
+                }],
+                None,
+            );
+            draw(interface.as_mut(), &mut ctx);
+            send(&mut ctx, &theme);
+            let visible = text(&draw(interface.as_mut(), &mut ctx));
+            assert!(
+                visible.contains("Share files")
+                    && visible.contains("Add a file or folder in Files")
+            );
+            let picker = page_description(sharing_ui::send_picker(), &mut ctx, &theme);
             assert!(matches!(
                 &picker,
-                PageType::Display { title, bumper: Bumper::None, .. } if title == "Share files"
+                PageType::Content { header, bumper: Bumper::None, .. } if header.title() == "Share files"
             ));
             assert!(
                 !page_body(&picker)
-                    .iter()
+                    .into_iter()
                     .any(|display| matches!(display, Display::Actions { .. }))
             );
             let lists: Vec<_> = page_body(&picker)
-                .iter()
+                .into_iter()
                 .filter_map(|display| match display {
                     Display::List { items, .. } => Some(items),
                     _ => None,
@@ -2316,21 +3246,30 @@ fn shared_send_and_receive_bumpers_open_their_flows_without_side_effects() {
             assert!(!visible.contains("Removed folder"));
             assert!(!visible.contains("hidden.txt"));
 
-            let receive_flow = receive(&mut ctx, &theme);
-            assert_eq!(receive_flow.0.len(), 1);
-            let receiving = page_description(receive_flow.0[0].clone(), &mut ctx, &theme);
+            receive(&mut ctx, &theme);
+            let visible = text(&draw(interface.as_mut(), &mut ctx));
+            assert!(visible.contains("Receive"));
+            for label in ["Paste clipboard", "Scan QR code", "Show my QR code"] {
+                assert!(
+                    has_button_label(&visible, label),
+                    "Missing {label}: {visible}"
+                );
+            }
+            assert!(!visible.contains("Share AirName"));
+            tap_text(interface.as_mut(), &mut ctx, "Show my QR code");
+            let visible = text(&draw(interface.as_mut(), &mut ctx));
+            assert!(visible.contains("Share AirName") && has_button_label(&visible, "Share"));
+            let receiving = page_description(sharing_ui::receive_name(me()), &mut ctx, &theme);
             assert!(
-                matches!(&receiving, PageType::Display { title, .. } if title == "Receive files")
+                matches!(&receiving, PageType::Content { header, .. } if header.title() == "Share AirName")
             );
-            assert_eq!(primary_label(&receiving), Some("Copy name"));
+            assert_eq!(primary_label(&receiving), Some("Share"));
+            assert!(page_body(&receiving).into_iter().any(
+                |item| matches!(item, Display::QRCode {data, ..} if data == &Invitation::Contact(me()).url())
+            ));
             let mut rendered = Page::Static(Box::new(receiving)).build(&mut ctx, &theme, None, 1);
             let visible = text(&draw(rendered.as_mut(), &mut ctx));
-            assert!(
-                visible
-                    .split_whitespace()
-                    .collect::<String>()
-                    .contains(&me().to_string())
-            );
+            assert!(visible.contains("Scan to share this AirName."));
             assert_eq!(ctx.air.instances::<Vault>().list().len(), vault_count);
             assert!(ctx.air.instances::<Transfer>().list().is_empty());
             assert!(air.1.lock().unwrap().is_none());
@@ -2386,7 +3325,7 @@ fn shared_send_picker_lists_live_files_and_folders_with_parent_paths_without_sen
         let before = vault.pending().entries.clone();
         let picker = page_description(sharing_ui::send_picker(), &mut ctx, &theme);
         let titles: Vec<_> = page_body(&picker)
-            .iter()
+            .into_iter()
             .filter_map(|display| match display {
                 Display::List { items, .. } => Some(items),
                 _ => None,
@@ -2425,13 +3364,10 @@ fn shared_send_picker_lists_live_files_and_folders_with_parent_paths_without_sen
             let flow = sharing_ui::send_flow(&mut ctx, vault.clone(), id, &theme);
             assert_eq!(flow.0.len(), 1);
             let selector = page_description(flow.0.into_iter().next().unwrap(), &mut ctx, &theme);
-            assert!(matches!(
-                &selector,
-                PageType::Form {
-                    item: chk::Input::Search { .. },
-                    ..
-                }
-            ));
+            assert_eq!(
+                cta_action_labels(&selector),
+                vec!["New contact", "Create link"]
+            );
             let form = manual_recipient_page(selector, &mut ctx, &theme);
             let mut rendered = Page::Static(Box::new(form)).build(&mut ctx, &theme, None, 1);
             let visible = text(&draw(rendered.as_mut(), &mut ctx));
@@ -2474,7 +3410,8 @@ fn collaborative_home_and_invitation_pages_render_without_joining_or_sharing() {
             1,
             "Shared shows exactly one file list, with utilities in its Info header"
         );
-        let Display::List { label, items, .. } = &page_body(&root)[0] else {
+        let Display::List { label, items, .. } = page_body(&root).into_iter().next().unwrap()
+        else {
             panic!("Shared must be a file list");
         };
         assert_eq!(label, &None);
@@ -2485,19 +3422,21 @@ fn collaborative_home_and_invitation_pages_render_without_joining_or_sharing() {
                 .collect::<Vec<_>>(),
             vec!["received-note.txt", "owned-folder", "received-folder"]
         );
-        assert_eq!(items[2], items[2].clone().with_badge(true));
-        assert_eq!(items[0], items[0].clone().with_badge(false));
+        assert!(items[2].badge);
+        assert!(!items[0].badge);
         assert_eq!(primary_label(&root), Some("Send"));
-        assert!(
-            matches!(&root, PageType::Root { bumper_b: Some((label, _)), .. } if label == "Receive")
-        );
+        assert!(matches!(&root, PageType::Content {
+                bumper: Bumper::Footer(chk::design_system::Footer::Home {
+                    second: Some((label, _)), ..
+                }), ..
+            } if label == "Receive"));
         let (icon, options) = header_description(root.clone(), &mut ctx, &theme);
         assert_eq!(icon, Icons::Info);
-        let mut rendered = Page::Static(Box::new(options)).build(&mut ctx, &theme, None, 1);
-        let options_visible = text(&draw(rendered.as_mut(), &mut ctx));
+        let options_visible = options;
         assert!(
             options_visible.contains("Saved edits") && options_visible.contains("Older copies")
         );
+        assert!(!options_visible.contains("Open invitation"));
         let mut root = Page::Static(Box::new(root)).build_root(&mut ctx, &theme);
         let visible = text(&draw(root.as_mut(), &mut ctx));
         for expected in [
@@ -2507,11 +3446,16 @@ fn collaborative_home_and_invitation_pages_render_without_joining_or_sharing() {
             "Invitation",
             "Read & write",
             "From ",
-            "2 people",
         ] {
             assert!(visible.contains(expected), "Missing {expected}: {visible}");
         }
-        for removed in ["Received", "Shared by you", "Saved edits", "Older copies"] {
+        for removed in [
+            "Received",
+            "Shared by you",
+            "Saved edits",
+            "Older copies",
+            "2 people",
+        ] {
             assert!(
                 !visible.contains(removed),
                 "Main file list contains an obsolete section: {visible}"
@@ -2525,12 +3469,24 @@ fn collaborative_home_and_invitation_pages_render_without_joining_or_sharing() {
         assert_eq!(primary_label(&page), Some("Join shared folder"));
         assert!(
             !page_body(&page)
-                .iter()
+                .into_iter()
                 .any(|item| matches!(item, Display::Actions { .. }))
         );
         let (icon, info) = header_description(page.clone(), &mut ctx, &theme);
         assert_eq!(icon, Icons::Info);
-        assert_eq!(primary_label(&info), Some("Decline invitation"));
+        assert!(has_button_label(&info, "Decline invitation"));
+        assert!(has_button_label(&info, "Copy"));
+        assert!(
+            info.contains("Shared by") && info.contains(&peer().to_string()),
+            "Sender attribution stays available: {info}"
+        );
+        assert!(!info.contains("People with access"));
+        for participant_status in ["Owner", "Joined", "Invited"] {
+            assert!(
+                !info.lines().any(|line| line == participant_status),
+                "Sharing information must not list participants: {info}"
+            );
+        }
         let mut rendered = Page::Static(Box::new(page)).build(&mut ctx, &theme, None, 1);
         let visible = text(&draw(rendered.as_mut(), &mut ctx));
         assert!(visible.contains("Read & write access"));
@@ -2555,7 +3511,7 @@ fn joining_shared_access_creates_only_a_shortcut_and_opens_the_live_item() {
                 &mut ctx,
                 &theme,
             );
-            let PageType::Display {
+            let PageType::Content {
                 bumper: Bumper::Custom { action, .. },
                 ..
             } = page
@@ -2592,8 +3548,7 @@ fn joining_shared_access_creates_only_a_shortcut_and_opens_the_live_item() {
                 })
             );
             let (_, info) = header_description(page, &mut ctx, &theme);
-            let mut rendered = Page::Static(Box::new(info)).build(&mut ctx, &theme, None, 1);
-            assert!(text(&draw(rendered.as_mut(), &mut ctx)).contains("Files shortcut"));
+            assert!(info.contains("Files shortcut"));
             let root = space.pending().root;
             let live = page_description(
                 crate::collaboration_ui::item(space.clone(), root),
@@ -2644,11 +3599,14 @@ fn collaborative_share_and_invite_forms_are_pure_until_continue() {
             Page::Static(Box::new(selector.clone())).build(&mut ctx, &theme, None, 1);
         let visible = text(&draw(rendered.as_mut(), &mut ctx));
         assert!(visible.contains("Share access") && has_button_label(&visible, "New contact"));
-        assert!(
-            matches!(&selector, PageType::Form { item: chk::Input::Search { items, .. }, .. } if items.is_empty())
+        assert!(has_button_label(&visible, "Create link"));
+        assert_eq!(
+            cta_action_labels(&selector),
+            vec!["New contact", "Create link"]
         );
-        let manual = manual_recipient_page(selector, &mut ctx, &theme);
-        let mut rendered = Page::Static(Box::new(manual)).build(&mut ctx, &theme, None, 1);
+        assert!(!visible.contains("No items yet"));
+        let manual = manual_recipient_page(selector.clone(), &mut ctx, &theme);
+        let mut rendered = Page::Static(Box::new(manual.clone())).build(&mut ctx, &theme, None, 1);
         let visible = text(&draw(rendered.as_mut(), &mut ctx));
         assert!(
             has_button_label(&visible, "Paste clipboard")
@@ -2656,6 +3614,47 @@ fn collaborative_share_and_invite_forms_are_pure_until_continue() {
         );
         assert_eq!(*vault.pending(), before);
         assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
+        ctx.hardware = hardware::Hardware::new(TestHardware {
+            clipboard: Some(Invitation::Contact(peer()).url()),
+            ..TestHardware::default()
+        });
+        let mut app = <FigFiles as prism::Application>::new(&mut ctx);
+        draw(&mut app, &mut ctx);
+        browser::show(&mut ctx, &theme, Page::Static(Box::new(selector)));
+        tap_text(&mut app, &mut ctx, "New contact");
+        tap_text(&mut app, &mut ctx, "Paste clipboard");
+        tap_text(&mut app, &mut ctx, "Continue");
+        let visible = text(&draw(&mut app, &mut ctx));
+        assert!(visible.contains("Share access"));
+        assert!(Profile::try_from_name(&mut ctx, peer()).is_some());
+        let selection = sharing_ui::send_flow(&mut ctx, vault.clone(), id, &theme)
+            .0
+            .remove(0);
+        let selection = page_description(selection, &mut ctx, &theme);
+        let PageType::Form {
+            item: chk::Input::Selection(selector),
+            on_submit: Some(mut share),
+            ..
+        } = selection
+        else {
+            panic!("A saved contact enables CHK's normal sharing selector");
+        };
+        assert!(
+            selector
+                .items
+                .iter()
+                .any(|(_, key)| key == &peer().to_string())
+        );
+        assert!(matches!(
+            share(
+                &mut ctx,
+                &form_value("recipients", chk::State::Selection(vec![]))
+            ),
+            chk::FormComplete::Error(_)
+        ));
+        assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
+        assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+        assert!(air.1.lock().unwrap().is_none());
         let space = shared_fixture(&ctx, &air, false, true, MemberStatus::Active);
         let members = space.pending().members.clone();
         let selector = page_description(
@@ -2668,6 +3667,10 @@ fn collaborative_share_and_invite_forms_are_pure_until_continue() {
         let mut rendered =
             Page::Static(Box::new(selector.clone())).build(&mut ctx, &theme, None, 1);
         assert!(text(&draw(rendered.as_mut(), &mut ctx)).contains("Share access"));
+        assert!(has_button_label(
+            &text(&draw(rendered.as_mut(), &mut ctx)),
+            "Create link"
+        ));
         let manual = manual_recipient_page(selector, &mut ctx, &theme);
         let mut rendered = Page::Static(Box::new(manual)).build(&mut ctx, &theme, None, 1);
         let visible = text(&draw(rendered.as_mut(), &mut ctx));
@@ -2714,17 +3717,9 @@ fn contact_search_selects_multiple_people_and_continue_shares_only_one_space() {
                 sharing_ui::send_flow(&mut ctx, vault.clone(), id, &theme)
             };
             let selector = page_description(flow.0[0].clone(), &mut ctx, &theme);
-            let PageType::Form {
-                item: chk::Input::Search { items, label, .. },
-                ..
-            } = &selector
-            else {
-                panic!("Sharing uses the same CHK search form as Orange");
-            };
-            assert_eq!(label, "contact name");
-            assert_eq!(items.len(), 2, "Saved and history records are deduplicated");
-            assert!(items.iter().any(|(_, name)| *name == target));
-            assert!(items.iter().any(|(_, name)| *name == peer()));
+            assert!(
+                matches!(&selector, PageType::Form {id, item: chk::Input::Selection(_), .. } if id == "recipients")
+            );
             let selected = [target, peer()];
             let before_vault = vault.pending().clone();
             let before_count = ctx.air.instances::<SharedSpace>().list().len();
@@ -2739,14 +3734,29 @@ fn contact_search_selects_multiple_people_and_continue_shares_only_one_space() {
                 .next()
                 .unwrap();
             let before_book = book.pending().clone();
-            let mut app = FigFiles::new(&mut ctx);
+            let mut app = <FigFiles as prism::Application>::new(&mut ctx);
             draw(&mut app, &mut ctx);
             browser::show(&mut ctx, &theme, Page::Static(Box::new(selector)));
             let visible = text(&draw(&mut app, &mut ctx));
             assert!(visible.contains("Share access") && has_button_label(&visible, "New contact"));
             for recipient in selected {
-                let full = recipient.to_string();
-                let short = format!("{}…{}", &full[..10], &full[full.len() - 8..]);
+                let short = Profile::try_from_name(&mut ctx, recipient)
+                    .unwrap()
+                    .pending()
+                    .username
+                    .clone();
+                assert_eq!(
+                    visible.lines().filter(|line| *line == short).count(),
+                    1,
+                    "Saved and history contacts must be deduplicated: {visible}"
+                );
+            }
+            for recipient in selected {
+                let short = Profile::try_from_name(&mut ctx, recipient)
+                    .unwrap()
+                    .pending()
+                    .username
+                    .clone();
                 tap_text(&mut app, &mut ctx, &short);
                 let visible = text(&draw(&mut app, &mut ctx));
                 assert!(visible.contains(&short) && visible.contains("Share access"));
@@ -2764,6 +3774,14 @@ fn contact_search_selects_multiple_people_and_continue_shares_only_one_space() {
                 assert_eq!(Some(space.pending().members.clone()), before_members);
             }
             assert_eq!(*book.pending(), before_book);
+            assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+            assert!(
+                air.3
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|key| key.0 != TypeId::of::<DeliverLink>())
+            );
             assert!(
                 air.1.lock().unwrap().is_none(),
                 "Selection must not grant access before Continue"
@@ -2823,11 +3841,14 @@ fn new_contact_returns_to_search_with_previous_and_new_recipients_selected() {
         else {
             unreachable!()
         };
-        let mut app = FigFiles::new(&mut ctx);
+        let mut app = <FigFiles as prism::Application>::new(&mut ctx);
         draw(&mut app, &mut ctx);
         browser::show(&mut ctx, &theme, Page::Static(Box::new(selector)));
-        let full_peer = peer().to_string();
-        let short_peer = format!("{}…{}", &full_peer[..10], &full_peer[full_peer.len() - 8..]);
+        let short_peer = Profile::try_from_name(&mut ctx, peer())
+            .unwrap()
+            .pending()
+            .username
+            .clone();
         tap_text(&mut app, &mut ctx, &short_peer);
         tap_text(&mut app, &mut ctx, "New contact");
         assert!(has_button_label(
@@ -2844,14 +3865,18 @@ fn new_contact_returns_to_search_with_previous_and_new_recipients_selected() {
         assert!(!has_button_label(&visible, "Paste clipboard"));
         tap_text(&mut app, &mut ctx, "New contact");
         let before_count = air.0.lock().unwrap().len();
-        for invalid in ["bad-name".to_string(), me().to_string()] {
-            submit(&mut ctx, &vec![chk::State::Text(invalid)]);
+        for invalid in ["bad-name".to_string(), "03".to_string()] {
+            submit(&mut ctx, &form_value("airname", chk::State::Text(invalid)));
             draw(&mut app, &mut ctx);
             assert_eq!(air.0.lock().unwrap().len(), before_count);
             assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
         }
         let added = air::Secret::new().name();
-        submit(&mut ctx, &vec![chk::State::Text(format!("  {added}\n"))]);
+        submit(
+            &mut ctx,
+            &form_value("airname", chk::State::Text(format!("  {added}\n"))),
+        )
+        .run(&mut ctx, &theme);
         let visible = text(&draw(&mut app, &mut ctx));
         assert!(
             visible.contains("Share access") && visible.contains(&short_peer),
@@ -2865,12 +3890,16 @@ fn new_contact_returns_to_search_with_previous_and_new_recipients_selected() {
             .into_values()
             .next()
             .unwrap();
-        assert_eq!(book.pending().contacts.len(), 2);
-        assert!(book.pending().contacts.contains_key(&added));
+        assert_eq!(
+            book.pending().contacts.len(),
+            1,
+            "New contacts use CHK profiles, without rewriting the legacy book"
+        );
+        assert!(Profile::try_from_name(&mut ctx, added).is_some());
         assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
         assert!(
             air.1.lock().unwrap().is_none(),
-            "Saving a contact must only update the private book"
+            "Saving a contact must only update its private CHK profile"
         );
         *air.1.lock().unwrap() = Some(Vec::new());
         tap_text(&mut app, &mut ctx, "Continue");
@@ -3084,14 +4113,15 @@ fn shared_text_editor_preserves_the_complete_draft_when_an_edit_races() {
         let flow = crate::collaboration_ui::edit_text_flow(space.clone(), file, &theme);
         let page = page_description(flow.0.into_iter().next().unwrap(), &mut ctx, &theme);
         let PageType::Edit {
-            input, mut on_save, ..
+            items, mut on_save, ..
         } = page.clone()
         else {
             panic!("Shared text uses a CHK edit form");
         };
         assert!(
-            matches!(&input[0], chk::Input::Text { preset: Some(value), .. } if value == &original)
+            matches!(&items[0].input, chk::Input::Text { preset: Some(value), .. } if value == &original)
         );
+        assert_eq!(items[0].id, "content");
         assert!(original.len() > 16_000);
         let mut rendered = Page::Static(Box::new(page)).build(&mut ctx, &theme, None, 1);
         assert!(text(&draw(rendered.as_mut(), &mut ctx)).contains("Edit shared text"));
@@ -3099,6 +4129,22 @@ fn shared_text_editor_preserves_the_complete_draft_when_an_edit_races() {
             drafts::list(&ctx.air).is_empty(),
             "Opening an editor is read-only"
         );
+
+        for revision in 1..=2 {
+            let saved = format!("{original}\nSave {revision}");
+            assert!(matches!(
+                on_save(
+                    &mut ctx,
+                    &form_value("content", chk::State::Text(saved.clone()))
+                ),
+                chk::FormComplete::None
+            ));
+            assert_eq!(space.pending().read_file(file).unwrap(), saved.as_bytes());
+            assert!(
+                space.pending().conflicts(file).is_empty(),
+                "Saving again must use the editor's last saved revision"
+            );
+        }
 
         let expected = space.pending().content_hash(file).unwrap();
         space
@@ -3112,7 +4158,10 @@ fn shared_text_editor_preserves_the_complete_draft_when_an_edit_races() {
             .clone()
             .unwrap();
         let submitted = format!("{original}\nMY COMPLETE UNSHORTENED EDIT");
-        let result = on_save(&mut ctx, &vec![chk::State::Text(submitted.clone())]);
+        let result = on_save(
+            &mut ctx,
+            &form_value("content", chk::State::Text(submitted.clone())),
+        );
         assert!(matches!(result, chk::FormComplete::Next(_)));
         assert_eq!(
             space.pending().read_file(file).unwrap(),
@@ -3126,12 +4175,23 @@ fn shared_text_editor_preserves_the_complete_draft_when_an_edit_races() {
                 .any(|edit| edit.bytes == submitted.as_bytes())
         );
         let backups = drafts::list(&ctx.air);
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].pending().bytes, submitted.as_bytes());
-        assert!(!backups[0].pending().resolved);
-        let mut detail =
-            crate::collaboration_ui::details(space.clone(), file).build(&mut ctx, &theme, None, 1);
-        assert!(text(&draw(detail.as_mut(), &mut ctx)).contains("Edits to review"));
+        assert_eq!(backups.len(), 3);
+        let backup = backups
+            .iter()
+            .find(|draft| draft.pending().bytes == submitted.as_bytes())
+            .unwrap();
+        assert!(!backup.pending().resolved);
+        let detail = page_description(
+            crate::collaboration_ui::details(space.clone(), file),
+            &mut ctx,
+            &theme,
+        );
+        assert!(cta_action_labels(&detail).contains(&"Edits to review"));
+        let mut detail = Page::Static(Box::new(detail)).build(&mut ctx, &theme, None, 1);
+        assert!(has_button_label(
+            &text(&draw(detail.as_mut(), &mut ctx)),
+            "Edits to review"
+        ));
         let mut conflicts =
             crate::collaboration_ui::conflicts_page(space, file).build(&mut ctx, &theme, None, 1);
         assert!(text(&draw(conflicts.as_mut(), &mut ctx)).contains("Saved edit 1"));
@@ -3167,8 +4227,8 @@ fn saved_edits_remain_visible_after_sync_and_retry_keeps_a_private_backup() {
         let home = page_description(sharing_ui::home(), &mut ctx, &theme);
         let (icon, options) = header_description(home, &mut ctx, &theme);
         assert_eq!(icon, Icons::Info);
-        let mut options = Page::Static(Box::new(options)).build(&mut ctx, &theme, None, 1);
-        assert!(text(&draw(options.as_mut(), &mut ctx)).contains("Saved edits"));
+        assert!(options.contains("Saved edits"));
+        assert!(!options.contains("Open invitation"));
         let mut list = crate::collaboration_ui::saved_edits().build(&mut ctx, &theme, None, 1);
         let visible = text(&draw(list.as_mut(), &mut ctx));
         assert!(visible.contains("received-note.txt") && visible.contains("Private saved edit"));
@@ -3184,13 +4244,13 @@ fn saved_edits_remain_visible_after_sync_and_retry_keeps_a_private_backup() {
         assert_eq!(primary_label(&page), Some("Retry saved edit"));
         let (icon, discard) = header_description(page.clone(), &mut ctx, &theme);
         assert_eq!(icon, Icons::Delete);
-        assert_eq!(primary_label(&discard), Some("Discard saved edit"));
+        assert!(has_button_label(&discard, "Discard saved edit"));
         let mut rendered = Page::Static(Box::new(page.clone())).build(&mut ctx, &theme, None, 1);
         assert!(has_button_label(
             &text(&draw(rendered.as_mut(), &mut ctx)),
             "Export saved edit"
         ));
-        let PageType::Display {
+        let PageType::Content {
             bumper:
                 Bumper::Custom {
                     action,
@@ -3219,8 +4279,14 @@ fn saved_edits_remain_visible_after_sync_and_retry_keeps_a_private_backup() {
         drafts::resolve(&mut remaining[0].clone()).unwrap();
         let home = page_description(sharing_ui::home(), &mut ctx, &theme);
         assert!(
-            matches!(home, PageType::Root { header: None, .. }),
-            "Empty Shared options must not leave a header"
+            matches!(
+                home,
+                PageType::Content {
+                    header: chk::design_system::Header::Home { action: None, .. },
+                    ..
+                }
+            ),
+            "Resolving all saved edits should remove the empty Shared options header"
         );
         assert!(
             air.1.lock().unwrap().is_none(),
@@ -3283,8 +4349,7 @@ fn shared_details_distinguish_incoming_outgoing_and_transfer_states() {
                     (true, TransferStatus::Declined, "Declined", "Declined"),
                 ] {
                     let (mut ctx, air) = context_with_air(mobile);
-                    let instance =
-                        transfer_fixture(&ctx, &air, incoming, folder, ready, status.clone());
+                    let instance = transfer_fixture(&ctx, &air, incoming, folder, ready, status);
                     let title = instance.pending().title().to_string();
                     let mut page =
                         sharing_ui::detail(instance.clone()).build(&mut ctx, &theme(), None, 1);
@@ -3319,27 +4384,29 @@ fn shared_details_distinguish_incoming_outgoing_and_transfer_states() {
 }
 
 #[test]
-fn receiving_controls_use_primary_and_information_slots_without_inline_action_rows() {
+fn receiving_controls_offer_paste_scan_and_own_qr_and_require_confirmation_to_join() {
     for mobile in [true, false] {
-        let mut ctx = context(mobile);
+        let (mut ctx, air) = context_with_air(mobile);
         let theme = theme();
         let home = page_description(sharing_ui::home(), &mut ctx, &theme);
         assert_eq!(primary_label(&home), Some("Send"));
         assert!(
             !page_body(&home)
-                .iter()
+                .into_iter()
                 .any(|display| matches!(display, Display::Actions { .. }))
         );
-        let PageType::Root {
-            header,
-            bumper_a,
-            bumper_b,
+        let PageType::Content {
+            header: chk::design_system::Header::Home { action: None, .. },
+            bumper:
+                Bumper::Footer(chk::design_system::Footer::Home {
+                    first: bumper_a,
+                    second: bumper_b,
+                }),
             ..
         } = home
         else {
             panic!("Shared must be a CHK root");
         };
-        assert!(header.is_none());
         assert_eq!(
             bumper_a.as_ref().map(|(label, _)| label.as_str()),
             Some("Send")
@@ -3349,16 +4416,96 @@ fn receiving_controls_use_primary_and_information_slots_without_inline_action_ro
             Some("Receive")
         );
 
-        let receive = page_description(sharing_ui::receive_name(me()), &mut ctx, &theme);
-        assert_eq!(primary_label(&receive), Some("Copy name"));
-        assert!(
-            !page_body(&receive)
-                .iter()
-                .any(|display| matches!(display, Display::Actions { .. }))
+        let receive = page_description(
+            invitations::receive_flow(me()).0.remove(0),
+            &mut ctx,
+            &theme,
         );
-        let (icon, information) = header_description(receive, &mut ctx, &theme);
-        assert_eq!(icon, Icons::Info);
-        assert_eq!(primary_label(&information), Some("Share name"));
+        let PageType::Form {
+            id,
+            title,
+            item:
+                chk::Input::Text {
+                    actions: Some(actions),
+                    ..
+                },
+            on_submit: Some(mut submit),
+            ..
+        } = receive.clone()
+        else {
+            panic!("Receive must use CHK's invitation text form");
+        };
+        assert_eq!(id, "invitation");
+        assert_eq!(title, "Receive");
+        assert_eq!(actions.len(), 3);
+        assert_text_actions(&actions[..2]);
+        assert_eq!(
+            actions[2].presentation().label,
+            chk::ActionItem::format_label("Show my QR code")
+        );
+        assert_eq!(actions[2].presentation().icon, Icons::QrCode);
+        assert!(format!("{:?}", actions[2]).contains(&format!(
+            "QRCode {{ data: {:?}",
+            Invitation::Contact(me()).url()
+        )));
+        let mut rendered = Page::Static(Box::new(receive)).build(&mut ctx, &theme, None, 1);
+        let visible = text(&draw(rendered.as_mut(), &mut ctx));
+        for label in ["Paste clipboard", "Scan QR code", "Show my QR code"] {
+            assert!(
+                has_button_label(&visible, label),
+                "Missing {label}: {visible}"
+            );
+        }
+        assert!(matches!(
+            submit(
+                &mut ctx,
+                &form_value(
+                    "invitation",
+                    chk::State::Text("https://example.com/not-an-invite".into())
+                )
+            ),
+            chk::FormComplete::Error(_)
+        ));
+        let file = FileInvitation {
+            publisher: peer(),
+            space: Id::random(),
+            token: Id::random(),
+        };
+        let completed = submit(
+            &mut ctx,
+            &form_value("invitation", chk::State::Text(Invitation::File(file).url())),
+        );
+        let chk::FormComplete::Action(chk::Action::Flow { flow }) = completed else {
+            panic!("Submitting a file invitation should navigate to a confirmation");
+        };
+        let confirmation = page_description(flow.0[0].clone(), &mut ctx, &theme);
+        assert_eq!(primary_label(&confirmation), Some("Join shared item"));
+        assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+        assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
+        assert!(ctx.air.instances::<Vault>().list().is_empty());
+        assert!(air.3.lock().unwrap().is_empty());
+        assert!(air.1.lock().unwrap().is_none());
+        let PageType::Content {
+            bumper: Bumper::Custom { action, .. },
+            ..
+        } = confirmation
+        else {
+            panic!("Receiving requires the explicit Join action");
+        };
+        (action.get())(&mut ctx, &theme);
+        let jobs = ctx.air.instances::<LinkJob>().list();
+        assert_eq!(jobs.len(), 1);
+        let job = jobs.into_values().next().unwrap();
+        assert_eq!(job.pending().invitation, file);
+        assert_eq!(job.pending().purpose, Purpose::Join);
+        assert_eq!(job.pending().status, Status::Pending);
+        assert_eq!(
+            *air.3.lock().unwrap(),
+            vec![prism::service::Key::new::<DeliverLink>(me(), &job)]
+        );
+        assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
+        assert!(ctx.air.instances::<Vault>().list().is_empty());
+        assert!(air.1.lock().unwrap().is_none());
         assert!(ctx.air.instances::<Transfer>().list().is_empty());
     }
 }
@@ -3387,7 +4534,7 @@ fn transfer_primary_actions_follow_state_and_decline_stays_in_information() {
                     assert!(
                         matches!(
                             &detail,
-                            PageType::Display {
+                            PageType::Content {
                                 bumper: Bumper::None,
                                 ..
                             }
@@ -3397,19 +4544,19 @@ fn transfer_primary_actions_follow_state_and_decline_stays_in_information() {
                 }
                 assert!(
                     !page_body(&detail)
-                        .iter()
+                        .into_iter()
                         .any(|display| matches!(display, Display::Actions { .. }))
                 );
                 let (icon, information) = header_description(detail, &mut ctx, &theme);
                 assert_eq!(icon, Icons::Info);
-                assert_eq!(
-                    primary_label(&information),
-                    Some(if incoming && status == TransferStatus::Pending {
+                assert!(has_button_label(
+                    &information,
+                    if incoming && status == TransferStatus::Pending {
                         "Decline"
                     } else {
-                        "Copy name"
-                    })
-                );
+                        "Copy"
+                    },
+                ));
                 assert_eq!(instance.pending().status, status);
                 assert!(storage::open(&ctx.air).pending().entries.is_empty());
             }
@@ -3429,7 +4576,7 @@ fn a_saved_transfer_offers_opening_its_existing_copy_without_saving_again() {
         let entries = vault.pending().entries.clone();
         let page = page_description(sharing_ui::detail(instance.clone()), &mut ctx, &theme);
         assert_eq!(primary_label(&page), Some("Open in Files"));
-        let PageType::Display {
+        let PageType::Content {
             bumper:
                 Bumper::Custom {
                     action: chk::Action::Flow { flow },
@@ -3454,11 +4601,11 @@ fn a_saved_transfer_offers_opening_its_existing_copy_without_saving_again() {
                 Icons::Info
             );
         }
-        let PageType::Display { title, .. } = &destination else {
+        let PageType::Content { header, .. } = &destination else {
             panic!("Saved items open as a CHK display page");
         };
         assert_eq!(
-            title,
+            header.title(),
             if folder {
                 "received-folder"
             } else {
@@ -3484,7 +4631,7 @@ fn a_saved_transfer_offers_opening_its_existing_copy_without_saving_again() {
         );
         assert!(matches!(
             &page,
-            PageType::Display {
+            PageType::Content {
                 bumper: Bumper::None,
                 ..
             }
@@ -3499,7 +4646,7 @@ fn a_saved_transfer_offers_opening_its_existing_copy_without_saving_again() {
         );
         assert!(matches!(
             &page,
-            PageType::Display {
+            PageType::Content {
                 bumper: Bumper::None,
                 ..
             }
@@ -3795,4 +4942,356 @@ fn receiving_name_validation_rejects_nicknames_invalid_keys_and_self() {
         );
     }
     assert!(contacts::parse(&me().to_string(), me()).is_err());
+}
+
+#[test]
+fn invitation_links_roundtrip_strictly_and_keep_bearer_tokens_out_of_debug() {
+    let file = FileInvitation {
+        publisher: peer(),
+        space: "ab".repeat(32).parse().unwrap(),
+        token: "cd".repeat(32).parse().unwrap(),
+    };
+    let contact = Invitation::Contact(peer());
+    let shared = Invitation::File(file);
+    let router = invitations::router();
+    for invitation in [contact, shared] {
+        let url = invitation.url();
+        assert!(url.starts_with("https://therampstack.com/fig-files/invite.html#"));
+        assert!(!url.contains('?'));
+        assert_eq!(router.parse_invite(&url), Some(invitation));
+        assert_eq!(router.parse_invite(&format!("  {url}\n")), Some(invitation));
+        assert_eq!(
+            router.parse_invite(
+                &url.replace("https://therampstack.com", "https://www.therampstack.com")
+            ),
+            Some(invitation),
+        );
+    }
+    assert_eq!(
+        Invitation::parse(&format!("fig-files://contact/{}", peer())),
+        Some(contact)
+    );
+    assert_eq!(
+        Invitation::parse(&format!(
+            "fig-files://file/{}/{}/{}",
+            peer(),
+            file.space,
+            file.token
+        )),
+        Some(shared)
+    );
+    let contacts = invitations::contacts();
+    assert_eq!(contacts.parse_contact(&contact.url()), Some(peer()));
+    assert_eq!(contacts.parse_contact(&peer().to_string()), Some(peer()));
+    assert_eq!(contacts.parse_contact(&shared.url()), None);
+    for invalid in [
+        contact.url().replace("https:", "http:"),
+        contact.url().replace("therampstack.com", "therampstack.com.evil.example"),
+        contact.url().replace("therampstack.com", "therampstack.com@evil.example"),
+        contact.url().replace("/fig-files/invite.html", "/invite.html"),
+        contact.url().replace("#contact=", "?contact="),
+        contact.url().replace("#contact=", "?tracking=1#contact="),
+        contact.url().replace(&peer().to_string(), &peer().to_string().to_uppercase()),
+        format!("{}&contact={}", contact.url(), me()),
+        format!("{}#extra", contact.url()),
+        format!("{}%0a", contact.url()),
+        format!("{}&redirect=https://example.com", shared.url()),
+        shared.url().replace(&file.token.to_string(), &file.token.to_string().to_uppercase()),
+        shared.url().replace(&format!(".{}", file.token), ""),
+        format!("{}.{}", shared.url(), file.token),
+        format!("fig-files://file/{}/{}/{}/extra", peer(), file.space, file.token),
+        format!("fig-files://contact/{}?file={}", peer(), file.space),
+        "https://therampstack.com/fig-files/invite.html#contact=02ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+    ] {
+        assert_eq!(router.parse_invite(&invalid), None, "Accepted malformed invitation: {invalid}");
+    }
+    assert!(!format!("{shared:?}").contains(&file.token.to_string()));
+    assert!(!format!("{file:?}").contains(&file.token.to_string()));
+}
+
+#[test]
+fn opening_contact_invitations_saves_only_a_private_profile() {
+    for mobile in [true, false] {
+        let (mut ctx, air) = context_with_air(mobile);
+        let theme = theme();
+        let chk::Action::Flow { flow } = invitations::open(&mut ctx, Invitation::Contact(peer()))
+        else {
+            panic!("A contact invitation should open its profile");
+        };
+        let profile = Profile::try_from_name(&mut ctx, peer()).unwrap();
+        let alias = profile.pending().username.clone();
+        let mut page = flow.0[0].clone().build(&mut ctx, &theme, None, 1);
+        let visible = text(&draw(page.as_mut(), &mut ctx));
+        assert!(visible.contains(&alias));
+        assert!(!has_button_label(&visible, "Message"));
+        assert!(ctx.air.instances::<ChatRoom>().list().is_empty());
+        assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
+        assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+        assert!(ctx.air.instances::<Vault>().list().is_empty());
+        assert!(air.1.lock().unwrap().is_none());
+        assert!(air.3.lock().unwrap().is_empty());
+        invitations::open(&mut ctx, Invitation::Contact(peer()));
+        assert_eq!(ctx.air.instances::<Profile>().list().len(), 1);
+    }
+}
+
+#[test]
+fn invitation_publication_requires_explicit_creation_and_reuses_the_same_shared_item() {
+    for mobile in [true, false] {
+        for folder in [false, true] {
+            let (mut ctx, air) = context_with_air(mobile);
+            let theme = theme();
+            let mut vault = storage::open(&ctx.air);
+            let id = if folder {
+                storage::create_folder(&mut vault, None, "Linked folder").unwrap()
+            } else {
+                storage::import_file(
+                    &ctx.air,
+                    &mut vault,
+                    None,
+                    "linked.txt",
+                    b"shared bytes".to_vec(),
+                )
+                .unwrap()
+            };
+            let before = vault.pending().clone();
+            let confirmation = page_description(
+                invitations::create_page(LinkSource::Private(vault.clone(), id)),
+                &mut ctx,
+                &theme,
+            );
+            let mut rendered =
+                Page::Static(Box::new(confirmation.clone())).build(&mut ctx, &theme, None, 1);
+            let visible = text(&draw(rendered.as_mut(), &mut ctx));
+            assert!(visible.contains("Anyone with the link · Can edit"));
+            assert!(visible.contains("Anyone with this link can read and edit"));
+            assert_eq!(*vault.pending(), before);
+            assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
+            assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+            assert!(air.3.lock().unwrap().is_empty());
+            assert!(air.1.lock().unwrap().is_none());
+            let PageType::Content {
+                bumper: Bumper::Custom { action, .. },
+                ..
+            } = confirmation
+            else {
+                panic!("Creating an invitation must be an explicit bumper action");
+            };
+            (action.get())(&mut ctx, &theme);
+            let jobs = ctx.air.instances::<LinkJob>().list();
+            assert_eq!(jobs.len(), 1);
+            let job = jobs.into_values().next().unwrap();
+            let invitation = job.pending().invitation;
+            assert_eq!(job.pending().purpose, Purpose::Publish);
+            assert_eq!(job.pending().status, Status::Pending);
+            let space = collaboration::get(&ctx.air, invitation.space).unwrap();
+            assert!(space.pending().permits_link(invitation.token));
+            assert_eq!(space.pending().members.len(), 1);
+            assert_eq!(
+                space.pending().members.get(&me()),
+                Some(&MemberStatus::Active)
+            );
+            assert!(
+                matches!(vault.pending().get(id).unwrap().kind, storage::EntryKind::Shared { space: shared, .. } if shared == space.id())
+            );
+            assert_eq!(
+                *air.3.lock().unwrap(),
+                vec![prism::service::Key::new::<DeliverLink>(me(), &job)]
+            );
+            assert!(
+                air.1.lock().unwrap().is_none(),
+                "The fixture must not poll publication transport"
+            );
+            (action.get())(&mut ctx, &theme);
+            assert_eq!(ctx.air.instances::<SharedSpace>().list().len(), 1);
+            assert_eq!(ctx.air.instances::<LinkJob>().list().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn opening_file_invitations_does_not_receive_or_join_until_the_user_accepts() {
+    for mobile in [true, false] {
+        let (mut ctx, air) = context_with_air(mobile);
+        let theme = theme();
+        let file = FileInvitation {
+            publisher: peer(),
+            space: Id::random(),
+            token: Id::random(),
+        };
+        let chk::Action::Flow { flow } = invitations::open(&mut ctx, Invitation::File(file)) else {
+            panic!("A file invitation needs a confirmation flow");
+        };
+        let page = page_description(flow.0[0].clone(), &mut ctx, &theme);
+        let mut rendered = Page::Static(Box::new(page.clone())).build(&mut ctx, &theme, None, 1);
+        let visible = text(&draw(rendered.as_mut(), &mut ctx));
+        assert!(visible.contains("Read & write access"));
+        assert!(visible.contains("Anyone with this link can read and edit"));
+        assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
+        assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+        assert!(ctx.air.instances::<Vault>().list().is_empty());
+        assert!(air.1.lock().unwrap().is_none());
+        assert!(air.3.lock().unwrap().is_empty());
+        let PageType::Content {
+            bumper: Bumper::Custom { action, .. },
+            ..
+        } = page
+        else {
+            panic!("Joining an invitation must be explicit");
+        };
+        (action.get())(&mut ctx, &theme);
+        let jobs = ctx.air.instances::<LinkJob>().list();
+        assert_eq!(jobs.len(), 1);
+        let job = jobs.into_values().next().unwrap();
+        assert_eq!(job.pending().invitation, file);
+        assert_eq!(job.pending().purpose, Purpose::Join);
+        assert_eq!(job.pending().status, Status::Pending);
+        assert_eq!(
+            *air.3.lock().unwrap(),
+            vec![prism::service::Key::new::<DeliverLink>(me(), &job)]
+        );
+        assert!(ctx.air.instances::<SharedSpace>().list().is_empty());
+        assert!(ctx.air.instances::<Vault>().list().is_empty());
+        assert!(air.1.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn ready_invitation_page_copies_and_shares_the_same_fragment_link_only_on_action() {
+    for mobile in [true, false] {
+        let (mut ctx, air) = context_with_air(mobile);
+        let commands: HardwareLog = Default::default();
+        ctx.hardware = hardware::Hardware::new(TestHardware {
+            commands: Some(commands.clone()),
+            ..TestHardware::default()
+        });
+        let theme = theme();
+        let file = FileInvitation {
+            publisher: me(),
+            space: Id::random(),
+            token: Id::random(),
+        };
+        let mut job = ctx
+            .air
+            .instances::<LinkJob>()
+            .create((file, Purpose::Publish));
+        job.send(JobAction::Complete(Ok(())));
+        let page = page_description(invitations::job_page(job), &mut ctx, &theme);
+        let url = Invitation::File(file).url();
+        assert!(
+            page_body(&page)
+                .iter()
+                .any(|item| matches!(item, Display::QRCode { data, .. } if data == &url))
+        );
+        let mut rendered = Page::Static(Box::new(page.clone())).build(&mut ctx, &theme, None, 1);
+        draw(rendered.as_mut(), &mut ctx);
+        assert!(commands.lock().unwrap().is_empty());
+        let PageType::Content {
+            header:
+                chk::design_system::Header::Stack {
+                    action: Some((Icons::Copy, mut copy)),
+                    ..
+                },
+            bumper: Bumper::Custom { action: share, .. },
+            ..
+        } = page
+        else {
+            panic!("A ready invitation needs Copy and Share actions");
+        };
+        copy(&mut ctx, &theme);
+        (share.get())(&mut ctx, &theme);
+        assert_eq!(
+            *commands.lock().unwrap(),
+            vec![("copy", url.clone()), ("share", url.clone())]
+        );
+        let (request_url, fragment) = url.split_once('#').unwrap();
+        assert!(!request_url.contains(&file.token.to_string()));
+        assert!(fragment.ends_with(&file.token.to_string()));
+        assert!(air.1.lock().unwrap().is_none());
+        assert!(air.3.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn profile_airname_actions_keep_raw_copy_but_open_invitation_link_qr_codes() {
+    for mobile in [true, false] {
+        let (mut ctx, air) = context_with_air(mobile);
+        let theme = theme();
+        let commands: HardwareLog = Default::default();
+        ctx.hardware = hardware::Hardware::new(TestHardware {
+            commands: Some(commands.clone()),
+            ..TestHardware::default()
+        });
+        Profile::from_name(&mut ctx, peer());
+        let pages = [
+            (me(), contacts_ui::profile_root(&mut ctx).0),
+            (me(), contacts_ui::detail(me())),
+            (peer(), contacts_ui::detail(peer())),
+        ];
+        for (name, page) in pages {
+            let page = page_description(page, &mut ctx, &theme);
+            let displays = match &page {
+                PageType::Edit { display, .. } => display.iter().collect(),
+                PageType::Content { .. } => page_body(&page),
+                _ => panic!("A profile must expose CHK's standard AirName item"),
+            };
+            let actions = displays
+                .into_iter()
+                .find_map(|display| match display {
+                    Display::Cta {
+                        label,
+                        instructions,
+                        actions,
+                        ..
+                    } if label == "AirName" => {
+                        assert_eq!(instructions, &name.to_string());
+                        Some(actions)
+                    }
+                    _ => None,
+                })
+                .expect("Profiles keep their AirName actions");
+            let mut copy = actions
+                .iter()
+                .map(chk::ActionItem::presentation)
+                .find(|action| action.icon == Icons::Copy)
+                .unwrap()
+                .on_click;
+            copy(&mut ctx, &theme);
+            assert_eq!(
+                commands.lock().unwrap().pop(),
+                Some(("copy", name.to_string()))
+            );
+            let qr_action = actions
+                .iter()
+                .find(|action| action.presentation().icon == Icons::QrCode)
+                .unwrap();
+            let url = Invitation::Contact(name).url();
+            // CHK keeps ActionItem's nested flow private but exposes its
+            // descriptor through Debug. Check the QR payload specifically,
+            // then activate the real callbacks below to verify navigation.
+            assert!(format!("{qr_action:?}").contains(&format!("QRCode {{ data: {url:?}")));
+            let mut display_qr = qr_action.presentation().on_click;
+            let root = PageType::display("Test", vec![], None, Bumper::None, chk::Offset::Start)
+                .build_root(&mut ctx, &theme);
+            let mut interface = theme.interface(
+                &mut ctx,
+                vec![chk::RootInfo {
+                    icon: chk::RootIcon::Icon(Icons::Profile),
+                    label: "Profile".into(),
+                    page: root,
+                }],
+                None,
+            );
+            draw(interface.as_mut(), &mut ctx);
+            display_qr(&mut ctx, &theme);
+            let drawing = draw(interface.as_mut(), &mut ctx);
+            assert!(text(&drawing).contains("Share AirName"));
+
+            tap_text(interface.as_mut(), &mut ctx, "Share");
+            assert_eq!(commands.lock().unwrap().pop(), Some(("share", url)));
+        }
+        assert!(air.1.lock().unwrap().is_none());
+        assert!(ctx.air.instances::<LinkJob>().list().is_empty());
+        assert!(ctx.air.instances::<ChatRoom>().list().is_empty());
+    }
 }

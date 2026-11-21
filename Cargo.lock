@@ -789,14 +789,18 @@ checksum = "4b4b0fc281743d80256607bd65e8beedc42cb0787ea119c85b81b4c0eab85e5f"
 name = "chk"
 version = "2.0.0"
 dependencies = [
- "async-channel",
+ "air",
+ "air_server",
  "dyn-clone",
  "futures",
+ "log",
  "pelican_ui",
  "prism2",
  "ptsd2",
  "rand 0.8.8",
  "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1548,6 +1552,7 @@ dependencies = [
  "ramp2",
  "resvg",
  "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -2846,6 +2851,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "linkify"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1dfa36d52c581e9ec783a7ce2a5e0143da6237be5811a0b3153fedfdbe9f780"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2960,9 +2974,7 @@ dependencies = [
 
 [[package]]
 name = "maverick_os"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "485cbd2fc67ee656e70f236cff260214b2d649bfc9d5a25f0180c240ed643ce8"
+version = "5.0.2"
 dependencies = [
  "android_logger",
  "arboard",
@@ -4055,20 +4067,19 @@ name = "pelican_ui"
 version = "3.0.0"
 dependencies = [
  "bardecoder",
- "base64 0.22.1",
  "futures",
- "hex",
  "image 0.24.9",
  "include_dir",
+ "linkify",
  "media2",
  "prism2",
  "ptsd2",
  "qrcode",
- "serde",
  "serde_json",
  "unicode-segmentation",
  "ureq",
  "uuid",
+ "webbrowser",
 ]
 
 [[package]]
@@ -4281,8 +4292,6 @@ checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 [[package]]
 name = "prism2"
 version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b4de1c17b00613fc65d31ba782ba53179293dbe96ec0f8d862a8370fa034073"
 dependencies = [
  "air",
  "downcast-rs 2.0.2",
@@ -4347,12 +4356,16 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 name = "ptsd2"
 version = "0.2.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "downcast-rs 2.0.2",
  "dyn-clone",
  "hex",
+ "image 0.24.9",
  "include_dir",
+ "media2",
  "prism2",
+ "serde",
  "uuid",
 ]
 
@@ -4548,9 +4561,7 @@ dependencies = [
 
 [[package]]
 name = "ramp2"
-version = "3.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb9c2d549fae707c340c99b0818f4a82e2c6006a3b6e24bbfc04bbd1b061dacd"
+version = "3.0.4"
 dependencies = [
  "air",
  "air_notifications",
@@ -6335,6 +6346,22 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webbrowser"
+version = "1.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73e91ccd4698f2647d6137e8eb17a3f1dcfd63810be9029fb2398f507279b95b"
+dependencies = [
+ "jni 0.22.4",
+ "log",
+ "ndk-context",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "url",
+ "web-sys",
 ]
 
 [[package]]

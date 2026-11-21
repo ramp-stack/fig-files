@@ -7,8 +7,9 @@ use crate::{
     storage::{self, Entry, EntryId, EntryKind, FileBlob, Vault},
 };
 use chk::{
-    Action, Bumper, Context, Display, Flow, FlowBuilder, Form, FormAction, FormComplete, FormItem,
-    FormValidState, Icons, ListItem, Offset, Page, PageBuilder, PageType, State, Theme, Watch,
+    Action, ActionItem, Bumper, Context, Display, Flow, Form, FormAction, FormComplete, FormItem,
+    FormValidState, FormValues, Icons, Item, Offset, Page, PageBuilder, PageType, Theme,
+    ListWatch,
 };
 use futures::{
     FutureExt,
@@ -143,7 +144,7 @@ pub(crate) fn page(source: Source, fallback: Page) -> Page {
 
 fn with_control(source: Source, fallback: Page, control: PageControl) -> Page {
     let updates = Page::watching(
-        (Watch::list::<FileBlob>(), Watch::list::<SharedSpace>()),
+        (ListWatch::<FileBlob>::default(), ListWatch::<SharedSpace>::default()),
         |_: &mut Context, _: &Theme, _| {
             PageType::display("", vec![], None, Bumper::None, Offset::Start)
         },
@@ -316,22 +317,16 @@ impl PageBuilder for Preview {
                 id,
             ),
         };
-        let control = self.control.clone();
-        let header: Option<(Icons, Box<dyn FlowBuilder>)> = Some((
-            Icons::Info,
-            Box::new(move |_: &mut Context, _: &Theme| {
-                let info = if let Some(count) = count.filter(|count| *count > 1) {
-                    Page::Refreshing(Box::new(Info {
-                        base: info.builder().expect("watched file info"),
-                        control: control.clone(),
-                        count,
-                    }))
-                } else {
-                    info.clone()
-                };
-                Flow::new(vec![info])
-            }),
-        ));
+        let info = if let Some(count) = count.filter(|count| *count > 1) {
+            Page::Refreshing(Box::new(Info {
+                base: info.builder().expect("watched file info"),
+                control: self.control.clone(),
+                count,
+            }))
+        } else {
+            info
+        };
+        let header = Some((Icons::Info, Action::flow(Flow::new(vec![info]))));
         match &self.rendered {
             Some(Ok(Rendered::Photo(photo, _))) => PageType::photo(photo.clone(), header),
             Some(Ok(Rendered::Text(text))) => PageType::display(
@@ -344,7 +339,7 @@ impl PageBuilder for Preview {
             Some(Err(error)) => PageType::display(
                 &entry.name,
                 vec![
-                    Display::image(browser::entry_art(&entry), (160.0, 160.0)),
+                    Display::image(browser::entry_art(&entry), 160.0),
                     Display::label("Preview unavailable"),
                     Display::instructions(error),
                     Display::instructions("Open Info to export the original file."),
@@ -356,7 +351,7 @@ impl PageBuilder for Preview {
             None => PageType::display(
                 &entry.name,
                 vec![
-                    Display::image(browser::entry_art(&entry), (160.0, 160.0)),
+                    Display::image(browser::entry_art(&entry), 160.0),
                     Display::label("Loading preview…"),
                 ],
                 header,
@@ -379,24 +374,22 @@ impl PageBuilder for Info {
     }
     fn build(&mut self, ctx: &mut Context, theme: &Theme) -> PageType {
         let mut page = self.base.build(ctx, theme);
-        if let PageType::Display { items, .. } = &mut page {
+        if let PageType::Content { items, .. } = &mut page {
             items.insert(
                 0,
-                Display::list(
-                    None,
-                    vec![ListItem::plain(
-                        "PDF pages",
-                        &format!("Page {} of {}", self.control.page() + 1, self.count),
-                        None,
-                        Some(page_selector(
+                Item::Display(Display::cta(
+                    "PDF pages", None,
+                    &format!("Page {} of {}", self.control.page() + 1, self.count),
+                    vec![ActionItem::new(
+                        Action::flow(page_selector(
                             self.control.clone(),
                             self.control.page(),
                             self.count,
                             theme,
                         )),
+                        "PDF pages", Icons::Forward,
                     )],
-                    None,
-                ),
+                )),
             );
         }
         page
@@ -480,7 +473,7 @@ pub(crate) fn page_selector(
     control: PageControl,
     page: usize,
     count: usize,
-    theme: &Theme,
+    _theme: &Theme,
 ) -> Flow {
     let mut actions = Vec::new();
     for (enabled, label, icon, target) in [
@@ -494,31 +487,33 @@ pub(crate) fn page_selector(
     ] {
         if enabled {
             let control = control.clone();
-            actions.push(FormAction::Custom(
-                label.into(),
-                None,
-                icon,
+            actions.push(FormAction::Custom(ActionItem::new(
                 Action::custom(move |ctx: &mut Context, theme: &Theme| {
                     control.finish(target).run(ctx, theme)
                 }),
-            ));
+                label,
+                icon,
+            )));
         }
     }
     Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::text_with_preset(
-            &format!("Page {} of {count}", page + 1),
-            &(page + 1).to_string(),
-            Some(actions),
-            move |_: &mut Context, text: String| match parse_page(&text, count) {
-                Some(_) => FormValidState::Valid,
-                None => FormValidState::InvalidWithData(format!("Enter a page from 1 to {count}.")),
-            },
-        )],
+        vec![
+            FormItem::text_with_preset(
+                "page", uuid::Uuid::new_v4(), &format!("Page {} of {count}", page + 1),
+                &(page + 1).to_string(),
+                Some(actions),
+                move |_: &mut Context, text: String| match parse_page(&text, count) {
+                    Some(_) => FormValidState::Valid,
+                    None => {
+                        FormValidState::InvalidWithData(format!("Enter a page from 1 to {count}."))
+                    }
+                },
+            ),
+        ],
         None,
         None,
-        Box::new(move |_: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(text)) = states.first() else {
+        Box::new(move |_: &mut Context, values: &FormValues| {
+            let Some(text) = values.text("page") else {
                 return FormComplete::None;
             };
             parse_page(text, count)

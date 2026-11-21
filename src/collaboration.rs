@@ -5,8 +5,10 @@ use prism::air::{Air, Contract, Id, Instance, Metadata, Name};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 pub const MAX_SPACE_MEMBERS: usize = 128;
+const MAX_SPACE_LINKS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemberStatus {
@@ -36,7 +38,7 @@ impl fmt::Debug for ConflictVersion {
             .finish()
     }
 }
-#[derive(Clone, Hash, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct SharedSpace {
     pub owner: Name,
     pub created_at: u64,
@@ -48,6 +50,104 @@ pub struct SharedSpace {
     authors: BTreeMap<EntryId, Name>,
     last_edit: BTreeMap<EntryId, Id>,
     versions: BTreeMap<EntryId, Vec<ConflictVersion>>,
+    link_tokens: BTreeSet<Id>,
+}
+
+// Keep the original ten-field cache boundary. The old timestamp cannot reach
+// this sentinel because it is derived from nanoseconds divided by 1e9. Only
+// spaces with explicit link access use the extended third field.
+impl Serialize for SharedSpace {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.link_tokens.is_empty() {
+            (
+                &self.owner,
+                self.created_at,
+                self.root,
+                &self.tree,
+                &self.members,
+                self.ready,
+                &self.contents,
+                &self.authors,
+                &self.last_edit,
+                &self.versions,
+            )
+                .serialize(serializer)
+        } else {
+            (
+                &self.owner,
+                u64::MAX,
+                (self.created_at, self.root, &self.link_tokens),
+                &self.tree,
+                &self.members,
+                self.ready,
+                &self.contents,
+                &self.authors,
+                &self.last_edit,
+                &self.versions,
+            )
+                .serialize(serializer)
+        }
+    }
+}
+impl<'de> Deserialize<'de> for SharedSpace {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SharedSpaceVisitor;
+        impl<'de> serde::de::Visitor<'de> for SharedSpaceVisitor {
+            type Value = SharedSpace;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a shared file or folder")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                macro_rules! field {
+                    ($index:expr) => {
+                        seq.next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length($index, &self))?
+                    };
+                }
+                let owner = field!(0);
+                let timestamp: u64 = field!(1);
+                let (created_at, root, link_tokens) = if timestamp == u64::MAX {
+                    field!(2)
+                } else {
+                    (timestamp, field!(2), BTreeSet::new())
+                };
+                Ok(SharedSpace {
+                    owner,
+                    created_at,
+                    root,
+                    tree: field!(3),
+                    members: field!(4),
+                    ready: field!(5),
+                    contents: field!(6),
+                    authors: field!(7),
+                    last_edit: field!(8),
+                    versions: field!(9),
+                    link_tokens,
+                })
+            }
+        }
+        deserializer.deserialize_tuple(10, SharedSpaceVisitor)
+    }
+}
+impl Hash for SharedSpace {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.owner.hash(state);
+        self.created_at.hash(state);
+        self.root.hash(state);
+        self.tree.hash(state);
+        self.members.hash(state);
+        self.ready.hash(state);
+        self.contents.hash(state);
+        self.authors.hash(state);
+        self.last_edit.hash(state);
+        self.versions.hash(state);
+        if !self.link_tokens.is_empty() {
+            self.link_tokens.hash(state);
+        }
+    }
 }
 impl fmt::Debug for SharedSpace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -104,6 +204,8 @@ pub enum SharedAction {
         id: EntryId,
         conflict: Id,
     },
+    EnableLink(Id),
+    JoinLink(Id),
 }
 impl fmt::Debug for SharedAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -153,6 +255,8 @@ impl fmt::Debug for SharedAction {
                 .field("id", id)
                 .field("conflict", conflict)
                 .finish(),
+            Self::EnableLink(_) => f.write_str("EnableLink([redacted])"),
+            Self::JoinLink(_) => f.write_str("JoinLink([redacted])"),
         }
     }
 }
@@ -170,6 +274,8 @@ pub enum CollaborationError {
     Draft(crate::drafts::DraftError),
     NoRecipients,
     TooManyMembers,
+    InvalidLink,
+    TooManyLinks,
     PartialInvite {
         sent: usize,
         total: usize,
@@ -187,15 +293,17 @@ impl fmt::Display for CollaborationError {
             Self::Storage(error) => error.fmt(f),
             Self::Draft(error) => error.fmt(f),
             Self::Unauthorized => f.write_str("Join this shared item before making changes. Only invited members can join."),
-            Self::OwnName => f.write_str("Enter someone else's Fig Files receiving name."),
+            Self::OwnName => f.write_str("Enter someone else's AirName."),
             Self::NotReady => f.write_str("This shared item is still syncing. Try again shortly."),
             Self::InvalidSpace => f.write_str("This shared item has an invalid file tree."),
             Self::TooLarge => f.write_str("Shared items support 128 entries and saved conflicts, 32 MiB total, files up to 8 MiB, and 32 folder levels. Discard saved edits or remove unused files first."),
             Self::RootOperation => f.write_str("The shared root cannot be moved or deleted here. Remove its shortcut from your own Files instead."),
             Self::MissingConflict => f.write_str("This saved conflict has already been resolved or removed."),
             Self::ContentMismatch => f.write_str("The file contents do not match this shared item."),
-            Self::NoRecipients => f.write_str("Select at least one contact to share with."),
+            Self::NoRecipients => f.write_str("Choose at least one contact."),
             Self::TooManyMembers => f.write_str("A shared item can include up to 128 people, including you. Select fewer new contacts."),
+            Self::InvalidLink => f.write_str("This sharing link is invalid. Ask for a new link."),
+            Self::TooManyLinks => f.write_str("This item already has sharing links. Use an existing link."),
             Self::PartialInvite { sent, total, reason } => write!(f, "Queued invitations for {sent} of {total} selected contacts. The remaining invitations were not queued. {reason}"),
         }
     }
@@ -234,6 +342,7 @@ impl Contract for SharedSpace {
             authors: BTreeMap::new(),
             last_edit: BTreeMap::new(),
             versions: BTreeMap::new(),
+            link_tokens: BTreeSet::new(),
         }
     }
     fn apply(&mut self, action: SharedAction, metadata: Metadata) -> Self::Result {
@@ -268,6 +377,9 @@ impl SharedSpace {
     }
     pub fn can_write(&self, name: Name) -> bool {
         self.ready && self.members.get(&name) == Some(&MemberStatus::Active)
+    }
+    pub fn permits_link(&self, token: Id) -> bool {
+        self.is_ready() && self.link_tokens.contains(&token)
     }
     pub fn conflicts(&self, id: EntryId) -> Vec<ConflictVersion> {
         self.versions.get(&id).cloned().unwrap_or_default()
@@ -306,6 +418,7 @@ impl SharedSpace {
         if self.tree.owner != self.owner
             || self.members.get(&self.owner) != Some(&MemberStatus::Active)
             || self.members.len() > MAX_SPACE_MEMBERS
+            || self.link_tokens.len() > MAX_SPACE_LINKS
         {
             return Err(CollaborationError::InvalidSpace);
         }
@@ -458,6 +571,27 @@ impl SharedSpace {
                 match self.members.get(&signer) {
                     Some(MemberStatus::Invited | MemberStatus::Active) => {}
                     _ => return Err(CollaborationError::Unauthorized),
+                }
+                self.members.insert(signer, MemberStatus::Active);
+                Ok(ActionResult::Unit)
+            }
+            SharedAction::EnableLink(token) => {
+                self.authorize(signer)?;
+                if !self.link_tokens.contains(&token) && self.link_tokens.len() >= MAX_SPACE_LINKS {
+                    return Err(CollaborationError::TooManyLinks);
+                }
+                self.link_tokens.insert(token);
+                Ok(ActionResult::Unit)
+            }
+            SharedAction::JoinLink(token) => {
+                if !self.ready {
+                    return Err(CollaborationError::NotReady);
+                }
+                if !self.link_tokens.contains(&token) {
+                    return Err(CollaborationError::InvalidLink);
+                }
+                if !self.members.contains_key(&signer) && self.members.len() >= MAX_SPACE_MEMBERS {
+                    return Err(CollaborationError::TooManyMembers);
                 }
                 self.members.insert(signer, MemberStatus::Active);
                 Ok(ActionResult::Unit)
@@ -825,6 +959,62 @@ pub fn share_with(
     recipients: Vec<Name>,
 ) -> Result<Instance<SharedSpace>, CollaborationError> {
     let recipients = normalize_recipients(recipients, air.me())?;
+    let mut space = promote(air, vault, id)?;
+    invite_many(air, &mut space, recipients)?;
+    Ok(space)
+}
+
+/// Explicitly enable bearer-link access. Merely viewing a file or sharing it
+/// with named contacts never calls this path. Existing links are reused.
+pub fn enable_link(air: &Air, space: &mut Instance<SharedSpace>) -> Result<Id, CollaborationError> {
+    let snapshot = space.pending();
+    snapshot.validate()?;
+    snapshot.authorize(air.me())?;
+    if let Some(token) = snapshot.link_tokens.first() {
+        return Ok(*token);
+    }
+    drop(snapshot);
+    let token = Id::random();
+    dispatch(air, space, SharedAction::EnableLink(token))?;
+    Ok(token)
+}
+
+/// Promote one private item to the same canonical shared space used by named
+/// invitations, then enable a reusable link for read/write access.
+pub fn prepare_link(
+    air: &Air,
+    vault: &mut Instance<Vault>,
+    id: EntryId,
+) -> Result<(Instance<SharedSpace>, Id), CollaborationError> {
+    let mut space = promote(air, vault, id)?;
+    let token = enable_link(air, &mut space)?;
+    Ok((space, token))
+}
+
+pub fn join_link(
+    air: &Air,
+    vault: &mut Instance<Vault>,
+    space: &mut Instance<SharedSpace>,
+    token: Id,
+) -> Result<EntryId, CollaborationError> {
+    if vault.pending().owner != air.me() {
+        return Err(CollaborationError::Unauthorized);
+    }
+    dispatch(air, space, SharedAction::JoinLink(token))?;
+    let snapshot = space.pending();
+    Ok(storage::mount_shared(
+        vault,
+        space.id(),
+        snapshot.title(),
+        snapshot.is_folder(),
+    )?)
+}
+
+fn promote(
+    air: &Air,
+    vault: &mut Instance<Vault>,
+    id: EntryId,
+) -> Result<Instance<SharedSpace>, CollaborationError> {
     let snapshot = vault.pending();
     if snapshot.owner != air.me() {
         return Err(CollaborationError::Unauthorized);
@@ -832,10 +1022,7 @@ pub fn share_with(
     let expected = snapshot.subtree_fingerprint(id)?;
     let entry = snapshot.get(id).ok_or(StorageError::MissingEntry)?;
     if let EntryKind::Shared { space, .. } = entry.kind {
-        let mut space = get(air, space)?;
-        drop(snapshot);
-        invite_many(air, &mut space, recipients)?;
-        return Ok(space);
+        return get(air, space);
     }
     let mut items = Vec::new();
     let mut payloads = Vec::new();
@@ -895,7 +1082,6 @@ pub fn share_with(
     }
     dispatch(air, &mut space, SharedAction::Activate)?;
     storage::promote_shared(vault, id, space.id(), expected)?;
-    invite_many(air, &mut space, recipients)?;
     Ok(space)
 }
 fn edit(
@@ -1157,6 +1343,170 @@ mod tests {
         apply(space, member, SharedAction::Join).unwrap();
     }
     #[test]
+    fn link_access_requires_explicit_authorization_and_a_valid_token() {
+        let (alice, bob, mut space, _, file) = fixture();
+        let token = Id::random();
+        assert!(!space.permits_link(token));
+        assert_eq!(
+            apply(&mut space, bob.name(), SharedAction::EnableLink(token)),
+            Err(CollaborationError::Unauthorized)
+        );
+        assert_eq!(
+            apply(&mut space, bob.name(), SharedAction::JoinLink(token)),
+            Err(CollaborationError::InvalidLink)
+        );
+        apply(&mut space, alice.name(), SharedAction::EnableLink(token)).unwrap();
+        apply(&mut space, alice.name(), SharedAction::EnableLink(token)).unwrap();
+        assert_eq!(space.link_tokens.len(), 1);
+        assert!(space.permits_link(token));
+        assert_eq!(
+            apply(&mut space, bob.name(), SharedAction::Join),
+            Err(CollaborationError::Unauthorized),
+            "Named-contact Join remains restricted"
+        );
+        let before = postcard::to_allocvec(&space).unwrap();
+        assert_eq!(
+            apply(&mut space, bob.name(), SharedAction::JoinLink(Id::random())),
+            Err(CollaborationError::InvalidLink)
+        );
+        assert_eq!(postcard::to_allocvec(&space).unwrap(), before);
+        apply(&mut space, bob.name(), SharedAction::JoinLink(token)).unwrap();
+        apply(&mut space, bob.name(), SharedAction::JoinLink(token)).unwrap();
+        assert_eq!(space.members.len(), 2);
+        assert!(space.can_write(bob.name()));
+        apply(
+            &mut space,
+            bob.name(),
+            SharedAction::Edit(VaultAction::Rename {
+                id: file,
+                name: "edited by link recipient.txt".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            space.tree.get(file).unwrap().name,
+            "edited by link recipient.txt"
+        );
+        assert_eq!(space.read_file(file).unwrap(), b"original");
+        assert!(!format!("{space:?}").contains(&token.to_string()));
+        for action in [
+            SharedAction::EnableLink(token),
+            SharedAction::JoinLink(token),
+        ] {
+            assert!(!format!("{action:?}").contains(&token.to_string()));
+        }
+    }
+
+    #[test]
+    fn link_join_and_publication_limits_are_transactional_and_allow_retries() {
+        let (alice, bob, mut space, _, _) = fixture();
+        let token = Id::random();
+        apply(&mut space, alice.name(), SharedAction::EnableLink(token)).unwrap();
+        apply(&mut space, alice.name(), SharedAction::Grant(bob.name())).unwrap();
+        apply(&mut space, bob.name(), SharedAction::Decline).unwrap();
+        while space.members.len() < MAX_SPACE_MEMBERS {
+            space
+                .members
+                .insert(air::Secret::new().name(), MemberStatus::Invited);
+        }
+        let before = postcard::to_allocvec(&space).unwrap();
+        assert_eq!(
+            apply(
+                &mut space,
+                air::Secret::new().name(),
+                SharedAction::JoinLink(token)
+            ),
+            Err(CollaborationError::TooManyMembers)
+        );
+        assert_eq!(postcard::to_allocvec(&space).unwrap(), before);
+        apply(&mut space, bob.name(), SharedAction::JoinLink(token)).unwrap();
+        apply(&mut space, bob.name(), SharedAction::JoinLink(token)).unwrap();
+        assert_eq!(space.members.len(), MAX_SPACE_MEMBERS);
+        while space.link_tokens.len() < MAX_SPACE_LINKS {
+            apply(
+                &mut space,
+                bob.name(),
+                SharedAction::EnableLink(Id::random()),
+            )
+            .unwrap();
+        }
+        let before = postcard::to_allocvec(&space).unwrap();
+        assert_eq!(
+            apply(
+                &mut space,
+                bob.name(),
+                SharedAction::EnableLink(Id::random())
+            ),
+            Err(CollaborationError::TooManyLinks)
+        );
+        assert_eq!(postcard::to_allocvec(&space).unwrap(), before);
+        apply(&mut space, bob.name(), SharedAction::EnableLink(token)).unwrap();
+        let mut unfinished = space.clone();
+        unfinished.ready = false;
+        assert!(!unfinished.permits_link(token));
+        assert_eq!(
+            apply(&mut unfinished, bob.name(), SharedAction::JoinLink(token)),
+            Err(CollaborationError::NotReady)
+        );
+    }
+
+    #[test]
+    fn link_state_preserves_v1_cache_bytes_hashes_and_nested_boundaries() {
+        #[derive(Serialize, Hash)]
+        struct V1Space<'a> {
+            owner: Name,
+            created_at: u64,
+            root: EntryId,
+            tree: &'a Vault,
+            members: &'a BTreeMap<Name, MemberStatus>,
+            ready: bool,
+            contents: &'a BTreeMap<EntryId, Vec<u8>>,
+            authors: &'a BTreeMap<EntryId, Name>,
+            last_edit: &'a BTreeMap<EntryId, Id>,
+            versions: &'a BTreeMap<EntryId, Vec<ConflictVersion>>,
+        }
+        let (alice, _, mut space, _, _) = fixture();
+        let legacy = V1Space {
+            owner: space.owner,
+            created_at: space.created_at,
+            root: space.root,
+            tree: &space.tree,
+            members: &space.members,
+            ready: space.ready,
+            contents: &space.contents,
+            authors: &space.authors,
+            last_edit: &space.last_edit,
+            versions: &space.versions,
+        };
+        assert_eq!(
+            postcard::to_allocvec(&legacy).unwrap(),
+            postcard::to_allocvec(&space).unwrap()
+        );
+        assert_eq!(Id::hash(&legacy), Id::hash(&space));
+        let legacy_envelope = postcard::to_allocvec(&(vec![&legacy, &legacy], 42u64)).unwrap();
+        let (decoded, trailing): (Vec<SharedSpace>, u64) =
+            postcard::from_bytes(&legacy_envelope).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(trailing, 42);
+        assert!(decoded.iter().all(|item| item.link_tokens.is_empty()));
+        assert!(
+            decoded
+                .iter()
+                .all(|item| Id::hash(item) == Id::hash(&space))
+        );
+        let token = Id::random();
+        apply(&mut space, alice.name(), SharedAction::EnableLink(token)).unwrap();
+        let envelope =
+            postcard::to_allocvec(&(vec![decoded[0].clone(), space.clone()], 73u64)).unwrap();
+        let (restored, trailing): (Vec<SharedSpace>, u64) =
+            postcard::from_bytes(&envelope).unwrap();
+        assert_eq!(trailing, 73);
+        assert!(restored[0].link_tokens.is_empty());
+        assert!(restored[1].permits_link(token));
+        assert_eq!(Id::hash(&restored[1]), Id::hash(&space));
+    }
+
+    #[test]
     fn signed_membership_controls_all_writes_and_members_can_invite() {
         let (alice, bob, mut space, root, file) = fixture();
         let charlie = air::Secret::new();
@@ -1356,6 +1706,70 @@ mod tests {
         for (tag, action) in previous.into_iter().enumerate() {
             assert_eq!(postcard::to_allocvec(&action).unwrap()[0], tag as u8);
         }
+        assert_eq!(
+            postcard::to_allocvec(&SharedAction::EnableLink(id)).unwrap()[0],
+            10
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SharedAction::JoinLink(id)).unwrap()[0],
+            11
+        );
+    }
+
+    #[test]
+    fn link_recipients_replay_authorization_and_edit_the_same_encrypted_space_after_restart() {
+        let (alice, bob, state, root, file) = fixture();
+        let token = Id::random();
+        let mut sender = air::Instance::<SharedSpace>::new(
+            alice.clone(),
+            SharedInit {
+                nonce: Id::random(),
+                root,
+                items: state.tree.entries.values().cloned().collect(),
+            },
+        )
+        .unwrap();
+        sender
+            .send(SharedAction::Upload {
+                id: file,
+                bytes: b"original".to_vec(),
+            })
+            .unwrap();
+        sender.send(SharedAction::Activate).unwrap();
+        sender.send(SharedAction::EnableLink(token)).unwrap();
+        let mut server = TestServer::new();
+        server.sync(&mut sender);
+        // Receiving the channel capability alone does not bypass its write ACL.
+        let mut receiver =
+            air::Instance::<SharedSpace>::receive(bob.clone(), *sender.location()).unwrap();
+        server.sync(&mut receiver);
+        assert!(receiver.confirmed().unwrap().permits_link(token));
+        assert!(!receiver.confirmed().unwrap().can_write(bob.name()));
+        receiver.send(SharedAction::JoinLink(token)).unwrap();
+        let mut receiver: air::Instance<SharedSpace> =
+            postcard::from_bytes(&postcard::to_allocvec(&receiver).unwrap()).unwrap();
+        server.sync(&mut receiver);
+        server.sync(&mut sender);
+        assert!(receiver.confirmed().unwrap().can_write(bob.name()));
+        assert_eq!(receiver.id(), sender.id());
+        let expected = receiver.pending().unwrap().content_hash(file).unwrap();
+        receiver
+            .send(SharedAction::Replace {
+                id: file,
+                expected,
+                version: Id::random(),
+                bytes: b"updated through the invitation".to_vec(),
+            })
+            .unwrap();
+        server.sync(&mut receiver);
+        let mut sender: air::Instance<SharedSpace> =
+            postcard::from_bytes(&postcard::to_allocvec(&sender).unwrap()).unwrap();
+        server.sync(&mut sender);
+        assert_eq!(
+            sender.confirmed().unwrap().read_file(file).unwrap(),
+            b"updated through the invitation"
+        );
+        assert!(sender.confirmed().unwrap().permits_link(token));
     }
 
     #[test]

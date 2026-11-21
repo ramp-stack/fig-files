@@ -8,8 +8,9 @@ use crate::{
     storage::{self, EntryId, Vault},
 };
 use chk::{
-    Action, AvatarContent, AvatarIconStyle, Bumper, Context, Display, Flow, Form, FormAction,
-    FormComplete, FormItem, Icons, ListItem, Offset, Page, PageType, State, Theme, Watch,
+    Action, ActionItem, AvatarContent, AvatarIconStyle, Bumper, ContactInvitations, Context,
+    ContractWatch, Display, Flow, Form, FormAction, FormComplete, FormValues, Icons, Input,
+    ListItem, ListWatch, Offset, Page, PageType, Theme,
 };
 use prism::air::{Instance, Name};
 
@@ -18,51 +19,41 @@ fn short_name(name: Name) -> String {
     format!("{}…{}", &full[..10], &full[full.len() - 8..])
 }
 
-pub fn receive_name(name: Name) -> Page {
-    let full = name.to_string();
-    Page::Static(Box::new(PageType::display(
-        "Receive files",
-        vec![
-            Display::qr_code(&full, "Your Fig Files receiving name"),
-            Display::text(&full),
-            Display::instructions("Share this name to receive files and folders here."),
-        ],
-        Some((
-            Icons::Info,
-            Box::new(move |_: &mut Context, _: &Theme| Flow::new(vec![name_help(name)])),
-        )),
-        Bumper::custom("Copy name", Action::copy(&full)),
-        Offset::Start,
-    )))
+fn airname_item(name: Name, role: &str) -> Display {
+    let name = name.to_string();
+    Display::cta(
+        "AirName",
+        Some(role),
+        &name,
+        vec![ActionItem::new_with_active(
+            Action::copy(&name), "Copy", "Copied", Icons::Copy,
+        )],
+    )
 }
 
-fn name_help(name: Name) -> Page {
-    let full = name.to_string();
-    Page::Static(Box::new(PageType::display(
-        "Your receiving name",
-        vec![Display::instructions(
-            "Use the name shown in Fig Files. Your Orange app may have a different name. Invitations appear in Shared, where you can open the shared file or folder.",
-        )],
-        None,
-        Bumper::custom("Share name", Action::share(&full)),
-        Offset::Start,
-    )))
+pub fn receive_name(name: Name) -> Page {
+    let invitations = crate::invitations::contacts();
+    let mut page = PageType::qr_page(&invitations, name);
+    if let PageType::Content { items, .. } = &mut page {
+        for item in items {
+            if let chk::Item::Display(Display::QRCode { data, .. }) = item {
+                *data = invitations.contact_url(name);
+            }
+        }
+    }
+    Page::Static(Box::new(page))
 }
 
 pub fn home() -> Page {
     Page::watching(
         (
-            Watch::list::<SharedSpace>(),
-            Watch::list::<Transfer>(),
-            Watch::list::<EditDraft>(),
+            ListWatch::<SharedSpace>::default(),
+            ListWatch::<Transfer>::default(),
+            ListWatch::<EditDraft>::default(),
         ),
         |ctx: &mut Context,
          theme: &Theme,
-         (mut spaces, transfers, drafts): (
-            Vec<Instance<SharedSpace>>,
-            Vec<Instance<Transfer>>,
-            Vec<Instance<EditDraft>>,
-        )| {
+         (mut spaces, transfers, drafts): (Vec<Instance<SharedSpace>>, _, _)| {
             let me = ctx.air.me();
             spaces.sort_by_key(|space| std::cmp::Reverse(space.pending().created_at));
             let mut items = vec![];
@@ -86,12 +77,7 @@ pub fn home() -> Page {
                     "Read & write"
                 };
                 let subtitle = if owned {
-                    let people = space
-                        .members
-                        .values()
-                        .filter(|status| **status != MemberStatus::Declined)
-                        .count();
-                    format!("{people} people · {state}")
+                    state.to_owned()
                 } else {
                     format!("From {} · {state}", short_name(space.owner))
                 };
@@ -102,10 +88,7 @@ pub fn home() -> Page {
                 };
                 let row = ListItem::avatar(
                     theme
-                        .brand()
-                        .images
-                        .get(art)
-                        .cloned()
+                        .image(art)
                         .map(AvatarContent::image)
                         .unwrap_or_else(|| {
                             AvatarContent::icon(Icons::Send, AvatarIconStyle::Brand)
@@ -113,26 +96,32 @@ pub fn home() -> Page {
                     space.title(),
                     &subtitle,
                     None,
-                    Some(Flow::new(vec![invitation_detail(instance.clone())])),
-                )
-                .with_badge(!owned && *member == MemberStatus::Invited);
+                    Some(Action::flow(Flow::new(vec![invitation_detail(
+                        instance.clone(),
+                    )]))),
+                    !owned && *member == MemberStatus::Invited,
+                    None,
+                );
                 items.push(row);
             }
             let displays = vec![Display::list(
                 None,
                 items,
-                Some("Files and folders you share or receive will appear here."),
+                Some("No shared files yet."),
             )];
             let mut options = Vec::new();
             if drafts.iter().any(|instance| {
                 let draft = instance.pending();
                 draft.owner == me && !draft.resolved && draft.validate().is_ok()
             }) {
-                options.push(ListItem::plain(
+                options.push(Display::cta(
                     "Saved edits",
-                    "Private recovery drafts",
                     None,
-                    Some(Flow::new(vec![collaboration_ui::saved_edits()])),
+                    "Private recovery drafts",
+                    vec![ActionItem::new(
+                        Action::flow(Flow::new(vec![collaboration_ui::saved_edits()])),
+                        "Saved edits", Icons::Edit,
+                    )],
                 ));
             }
             let has_older_copies = transfers.iter().any(|instance| {
@@ -140,39 +129,35 @@ pub fn home() -> Page {
                 (transfer.sender == me || transfer.recipient == me) && transfer.validate().is_ok()
             });
             if has_older_copies {
-                options.push(ListItem::plain(
+                options.push(Display::cta(
                     "Older copies",
-                    "Copies sent before shared access",
                     None,
-                    Some(Flow::new(vec![legacy_home()])),
+                    "Copies sent before shared access",
+                    vec![ActionItem::new(
+                        Action::flow(Flow::new(vec![legacy_home()])),
+                        "Older copies", Icons::Copy,
+                    )],
                 ));
             }
             let header = (!options.is_empty()).then(|| {
                 let options = Page::Static(Box::new(PageType::display(
                     "Shared options",
-                    vec![Display::list(None, options, None)],
+                    options,
                     None,
                     Bumper::None,
                     Offset::Start,
                 )));
-                (
-                    Icons::Info,
-                    Box::new(move |_: &mut Context, _: &Theme| Flow::new(vec![options.clone()]))
-                        as Box<dyn chk::FlowBuilder>,
-                )
+                (Icons::Info, Action::flow(Flow::new(vec![options])))
             });
             PageType::root(
                 "Shared",
                 vec![],
                 displays,
                 header,
-                Some((
-                    "Send".into(),
-                    Box::new(|_: &mut Context, _: &Theme| Flow::new(vec![send_picker()])),
-                )),
+                Some(("Send".into(), Action::flow(Flow::new(vec![send_picker()])))),
                 Some((
                     "Receive".into(),
-                    Box::new(move |_: &mut Context, _: &Theme| Flow::new(vec![receive_name(me)])),
+                    Action::flow(crate::invitations::receive_flow(me)),
                 )),
             )
         },
@@ -181,7 +166,7 @@ pub fn home() -> Page {
 
 pub fn invitation_detail(instance: Instance<SharedSpace>) -> Page {
     Page::watching(
-        Watch::contract(instance),
+        ContractWatch::new(instance),
         |ctx: &mut Context, _: &Theme, instance: Instance<SharedSpace>| {
             let space = instance.pending();
             let me = ctx.air.me();
@@ -189,7 +174,7 @@ pub fn invitation_detail(instance: Instance<SharedSpace>) -> Page {
                 return PageType::display(
                     "Shared item unavailable",
                     vec![Display::instructions(
-                        "This shared item cannot be opened with your Fig Files name.",
+                        "This shared item cannot be opened with your AirName.",
                     )],
                     None,
                     Bumper::Done,
@@ -207,7 +192,7 @@ pub fn invitation_detail(instance: Instance<SharedSpace>) -> Page {
                     } else {
                         "file-icons/document"
                     },
-                    (80.0, 80.0),
+                    80.0,
                 ),
                 Display::label(&title),
                 Display::instructions(&format!("Shared by {}", short_name(space.owner))),
@@ -260,9 +245,7 @@ pub fn invitation_detail(instance: Instance<SharedSpace>) -> Page {
                 displays,
                 Some((
                     Icons::Info,
-                    Box::new(move |_: &mut Context, _: &Theme| {
-                        Flow::new(vec![invitation_info(info.clone())])
-                    }),
+                    Action::flow(Flow::new(vec![invitation_info(info)])),
                 )),
                 bumper,
                 Offset::Start,
@@ -273,7 +256,7 @@ pub fn invitation_detail(instance: Instance<SharedSpace>) -> Page {
 
 fn invitation_info(instance: Instance<SharedSpace>) -> Page {
     Page::watching(
-        (Watch::contract(instance), Watch::list::<Vault>()),
+        (ContractWatch::new(instance), ListWatch::<Vault>::default()),
         |ctx: &mut Context,
          _: &Theme,
          (instance, vaults): (Instance<SharedSpace>, Vec<Instance<Vault>>)| {
@@ -293,32 +276,12 @@ fn invitation_info(instance: Instance<SharedSpace>) -> Page {
                     Action::flow(Flow::new(vec![decline_invitation(instance.clone())])),
                 )
             } else {
-                Bumper::custom("Copy name", Action::copy(&space.owner.to_string()))
+                Bumper::None
             };
             let mut displays = vec![
-                Display::label("Shared by"),
-                Display::text(&space.owner.to_string()),
+                airname_item(space.owner, "Shared by"),
                 Display::instructions(
                     "Read and write access applies to the entire shared item. Changes are synchronized while Fig Files is online.",
-                ),
-                Display::list(
-                    Some("People with access"),
-                    space
-                        .members
-                        .iter()
-                        .filter(|(_, status)| **status != MemberStatus::Declined)
-                        .map(|(name, status)| {
-                            let label = if *name == space.owner {
-                                "Owner"
-                            } else if *status == MemberStatus::Active {
-                                "Joined"
-                            } else {
-                                "Invited"
-                            };
-                            ListItem::plain(&short_name(*name), label, None, None)
-                        })
-                        .collect(),
-                    None,
                 ),
             ];
             let shortcut = vaults.into_iter().find_map(|vault| {
@@ -331,15 +294,14 @@ fn invitation_info(instance: Instance<SharedSpace>) -> Page {
                 entry.map(|entry| (vault, entry))
             });
             if let Some((vault, entry)) = shortcut {
-                displays.push(Display::list(
-                    None,
-                    vec![ListItem::plain(
-                        "Files shortcut",
-                        &entry.name,
-                        None,
-                        Some(Flow::new(vec![browser::shortcut_page(vault, entry.id)])),
+                displays.push(Display::cta(
+                    "Files shortcut",
+                    Some(&entry.name),
+                    "",
+                    vec![ActionItem::new(
+                        Action::flow(Flow::new(vec![browser::shortcut_page(vault, entry.id)])),
+                        "Files shortcut", Icons::Home,
                     )],
-                    None,
                 ));
             }
             PageType::display("Sharing details", displays, None, bumper, Offset::Start)
@@ -369,7 +331,7 @@ fn decline_invitation(instance: Instance<SharedSpace>) -> Page {
 
 pub(crate) fn legacy_home() -> Page {
     Page::watching(
-        Watch::list::<Transfer>(),
+        ListWatch::<Transfer>::default(),
         |ctx: &mut Context, theme: &Theme, transfers: Vec<Instance<Transfer>>| {
             let me = ctx.air.me();
             let mut incoming = vec![];
@@ -412,10 +374,7 @@ pub(crate) fn legacy_home() -> Page {
                 };
                 let row = ListItem::avatar(
                     theme
-                        .brand()
-                        .images
-                        .get(art)
-                        .cloned()
+                        .image(art)
                         .map(AvatarContent::image)
                         .unwrap_or_else(|| {
                             AvatarContent::icon(Icons::Send, AvatarIconStyle::Brand)
@@ -423,9 +382,10 @@ pub(crate) fn legacy_home() -> Page {
                     transfer.title(),
                     &subtitle,
                     Some(&storage::format_size(transfer.total_size())),
-                    Some(Flow::new(vec![detail(instance.clone())])),
-                )
-                .with_badge(received && transfer.status == TransferStatus::Pending);
+                    Some(Action::flow(Flow::new(vec![detail(instance.clone())]))),
+                    received && transfer.status == TransferStatus::Pending,
+                    None,
+                );
                 if received {
                     incoming.push(row)
                 } else {
@@ -480,7 +440,10 @@ pub(crate) fn picker_selection(
 
 fn file_picker(recipient: Option<Name>) -> Page {
     Page::watching(
-        (Watch::list::<Vault>(), Watch::list::<SharedSpace>()),
+        (
+            ListWatch::<Vault>::default(),
+            ListWatch::<SharedSpace>::default(),
+        ),
         move |ctx: &mut Context,
               theme: &Theme,
               (vaults, spaces): (Vec<Instance<Vault>>, Vec<Instance<SharedSpace>>)| {
@@ -525,10 +488,7 @@ fn file_picker(recipient: Option<Name>) -> Page {
                     };
                     ListItem::avatar(
                         theme
-                            .brand()
-                            .images
-                            .get(art)
-                            .cloned()
+                            .image(art)
                             .map(AvatarContent::image)
                             .unwrap_or_else(|| {
                                 AvatarContent::icon(Icons::Send, AvatarIconStyle::Brand)
@@ -536,7 +496,11 @@ fn file_picker(recipient: Option<Name>) -> Page {
                         &entry.name,
                         &format!("{path} · {kind}"),
                         None,
-                        Some(picker_selection(ctx, vault, entry.id, recipient, theme)),
+                        Some(Action::flow(picker_selection(
+                            ctx, vault, entry.id, recipient, theme,
+                        ))),
+                        false,
+                        None,
                     )
                 })
                 .collect();
@@ -608,7 +572,7 @@ fn status(transfer: &Transfer, received: bool, confirmed: bool) -> &'static str 
 
 pub fn detail(instance: Instance<Transfer>) -> Page {
     Page::watching(
-        (Watch::contract(instance), Watch::list::<Vault>()),
+        (ContractWatch::new(instance), ListWatch::<Vault>::default()),
         |ctx: &mut Context,
          _: &Theme,
          (instance, vaults): (Instance<Transfer>, Vec<Instance<Vault>>)| {
@@ -618,7 +582,7 @@ pub fn detail(instance: Instance<Transfer>) -> Page {
                 return PageType::display(
                     "Transfer unavailable",
                     vec![Display::instructions(
-                        "This transfer is addressed to another identity.",
+                        "This transfer is addressed to another AirName.",
                     )],
                     None,
                     Bumper::Done,
@@ -657,7 +621,7 @@ pub fn detail(instance: Instance<Transfer>) -> Page {
                     } else {
                         "file-icons/document"
                     },
-                    (80.0, 80.0),
+                    80.0,
                 ),
                 Display::label(&title),
                 Display::instructions(&format!(
@@ -717,9 +681,7 @@ pub fn detail(instance: Instance<Transfer>) -> Page {
                 displays,
                 Some((
                     Icons::Info,
-                    Box::new(move |_: &mut Context, _: &Theme| {
-                        Flow::new(vec![transfer_info(info.clone())])
-                    }),
+                    Action::flow(Flow::new(vec![transfer_info(info)])),
                 )),
                 bumper,
                 Offset::Start,
@@ -742,7 +704,7 @@ fn saved_item(vault: Instance<Vault>, id: EntryId) -> Page {
 
 fn transfer_info(instance: Instance<Transfer>) -> Page {
     Page::watching(
-        Watch::contract(instance),
+        ContractWatch::new(instance),
         |ctx: &mut Context, _: &Theme, instance: Instance<Transfer>| {
             let transfer = instance.pending();
             let received = transfer.recipient == ctx.air.me();
@@ -761,8 +723,7 @@ fn transfer_info(instance: Instance<Transfer>) -> Page {
                 transfer.recipient
             };
             let mut displays = vec![
-                Display::label(if received { "From" } else { "To" }),
-                Display::text(&peer.to_string()),
+                airname_item(peer, if received { "From" } else { "To" }),
                 Display::instructions("A copy from when it was sent. Later edits are not shared."),
             ];
             if received && transfer.status == TransferStatus::Pending && !transfer.is_ready() {
@@ -776,7 +737,7 @@ fn transfer_info(instance: Instance<Transfer>) -> Page {
                     Action::flow(Flow::new(vec![decline_confirmation(instance.clone())])),
                 )
             } else {
-                Bumper::custom("Copy name", Action::copy(&peer.to_string()))
+                Bumper::None
             };
             PageType::display("Transfer details", displays, None, bumper, Offset::Start)
         },
@@ -805,8 +766,17 @@ fn decline_confirmation(instance: Instance<Transfer>) -> Page {
 }
 
 pub fn send_flow(ctx: &mut Context, vault: Instance<Vault>, id: EntryId, theme: &Theme) -> Flow {
-    recipient_flow(ctx, theme, move |ctx: &mut Context, names: Vec<Name>| {
-        match collaboration::share_with(&ctx.air, &mut vault.clone(), id, names) {
+    let link = crate::invitations::LinkSource::Private(vault.clone(), id);
+    recipient_flow(
+        ctx,
+        theme,
+        link,
+        move |ctx: &mut Context, names: Vec<Name>| match collaboration::share_with(
+            &ctx.air,
+            &mut vault.clone(),
+            id,
+            names,
+        ) {
             Ok(space) => {
                 let root = space.pending().root;
                 FormComplete::Next(collaboration_ui::item(space, root))
@@ -814,46 +784,135 @@ pub fn send_flow(ctx: &mut Context, vault: Instance<Vault>, id: EntryId, theme: 
             Err(error) => {
                 FormComplete::Next(browser::message("Could not share", &error.to_string()))
             }
-        }
-    })
+        },
+    )
 }
 
 fn recipient_flow(
     ctx: &mut Context,
     theme: &Theme,
+    link: crate::invitations::LinkSource,
     share: impl Fn(&mut Context, Vec<Name>) -> FormComplete + Clone + 'static,
 ) -> Flow {
-    let items = contacts_ui::search_items(ctx);
-    Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::search(
-            "Share access",
-            "contact name",
-            items,
-            Some(vec![FormAction::Custom(
-                "New contact".into(),
-                None,
-                Icons::Add,
-                Action::flow(Flow::from_form(contacts_ui::new_contact(theme))),
-            )]),
-        )],
-        None,
-        None,
-        Box::new(move |ctx: &mut Context, states: &Vec<State>| {
-            let Some(State::Search(names)) = states.first() else {
-                return FormComplete::None;
-            };
-            if names.is_empty() {
-                return FormComplete::None;
+    contacts_ui::sync_profiles(ctx);
+    let mut form = Form::new_message(&crate::invitations::contacts(), ctx, theme);
+    let Form::Flow {
+        inputs, on_submit, ..
+    } = &mut form
+    else {
+        unreachable!("CHK's new-message form is a flow");
+    };
+    let me = ctx.air.me().to_string();
+    let mut has_contacts = false;
+    for input in inputs.iter_mut().filter(|input| input.id == "recipients") {
+        input.title = "Share access".into();
+        if let Input::Selection(selector) = &mut input.input {
+            selector.items.retain(|(_, name)| name != &me);
+            has_contacts = !selector.items.is_empty();
+            selector.actions.push(FormAction::Custom(ActionItem::new(
+                Action::flow(Flow::new(vec![crate::invitations::create_page(
+                    link.clone(),
+                )])),
+                "Create link",
+                Icons::Link,
+            )));
+        }
+    }
+    if !has_contacts {
+        return empty_recipient_flow(theme, link, share);
+    }
+    // Keep CHK's selector and New contact flow intact. Only the final submit
+    // changes from creating a conversation to sharing this file or folder.
+    *on_submit = Box::new(move |ctx: &mut Context, values: &FormValues| {
+        let Some(keys) = values.selection("recipients") else {
+            return FormComplete::None;
+        };
+        let names = match ContactInvitations::selected_recipients(keys) {
+            Ok(names) => names,
+            Err(error) => return FormComplete::Error(error.into()),
+        };
+        if names
+            .iter()
+            .any(|name| chk::blocking::Block::am_i_blocked(ctx, *name))
+        {
+            return FormComplete::Error("A selected user has blocked you.".into());
+        }
+        let names = names
+            .into_iter()
+            .map(|name| crate::contacts::parse(&name.to_string(), ctx.air.me()))
+            .collect::<Result<Vec<_>, _>>();
+        match names {
+            Ok(names) => share(ctx, names),
+            Err(error) => FormComplete::Error(error.to_string()),
+        }
+    });
+    Flow::from_form(form)
+}
+
+/// CHK's empty selector has fixed status text. Show its real entry actions
+/// instead, then use the unchanged selector once there is a contact to choose.
+fn empty_recipient_flow(
+    theme: &Theme,
+    link: crate::invitations::LinkSource,
+    share: impl Fn(&mut Context, Vec<Name>) -> FormComplete + Clone + 'static,
+) -> Flow {
+    let mut contact_form = Form::new_contact(&crate::invitations::contacts());
+    if let Form::Flow { on_submit, .. } = &mut contact_form {
+        let mut save_contact = on_submit.clone();
+        let theme = theme.clone();
+        let link = link.clone();
+        *on_submit = Box::new(move |ctx: &mut Context, values: &FormValues| {
+            match save_contact(ctx, values) {
+                FormComplete::Next(_) => {
+                    // The CHK recipient form has one selection page. Restart
+                    // the contact flow there without selecting or sharing yet.
+                    let page = recipient_flow(ctx, &theme, link.clone(), share.clone())
+                        .0
+                        .into_iter()
+                        .next()
+                        .expect("The recipient flow has a page");
+                    FormComplete::Next(page)
+                }
+                result => result,
             }
-            share(ctx, names.clone())
-        }),
-    ))
+        });
+    }
+    Flow::new(vec![Page::Static(Box::new(PageType::display(
+        "Share access",
+        vec![
+            Display::cta(
+                "New contact",
+                None,
+                "",
+                vec![ActionItem::new(
+                    Action::flow(Flow::from_form(contact_form)),
+                    "New contact",
+                    Icons::Add,
+                )],
+            ),
+            Display::cta(
+                "Create link",
+                None,
+                "",
+                vec![ActionItem::new(
+                    Action::flow(Flow::new(vec![crate::invitations::create_page(link)])),
+                    "Create link",
+                    Icons::Link,
+                )],
+            ),
+        ],
+        None,
+        Bumper::None,
+        Offset::Start,
+    )))])
 }
 
 pub(crate) fn send_confirmation(vault: Instance<Vault>, id: EntryId, name: Name) -> Page {
     Page::watching(
-        (Watch::contract(vault), Watch::list::<SharedSpace>()),
+        (
+            ContractWatch::new(vault),
+            ListWatch::<SharedSpace>::default(),
+        ),
         move |ctx: &mut Context,
               _: &Theme,
               (vault, spaces): (Instance<Vault>, Vec<Instance<SharedSpace>>)| {
@@ -915,13 +974,21 @@ pub(crate) fn send_confirmation(vault: Instance<Vault>, id: EntryId, name: Name)
 }
 
 pub fn invite_flow(ctx: &mut Context, space: Instance<SharedSpace>, theme: &Theme) -> Flow {
-    recipient_flow(ctx, theme, move |ctx: &mut Context, names: Vec<Name>| {
-        match collaboration::invite_many(&ctx.air, &mut space.clone(), names) {
+    let link = crate::invitations::LinkSource::Shared(space.clone());
+    recipient_flow(
+        ctx,
+        theme,
+        link,
+        move |ctx: &mut Context, names: Vec<Name>| match collaboration::invite_many(
+            &ctx.air,
+            &mut space.clone(),
+            names,
+        ) {
             Ok(()) => FormComplete::Next(invitation_detail(space.clone())),
             Err(error) => FormComplete::Next(browser::message(
                 "Could not share access",
                 &error.to_string(),
             )),
-        }
-    })
+        },
+    )
 }

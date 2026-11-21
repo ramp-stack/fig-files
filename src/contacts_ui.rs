@@ -1,15 +1,15 @@
-//! Private saved contacts and sharing history, presented with public CHK pages.
+//! CHK contacts and profiles, with private legacy migration and file actions.
 use crate::{
-    browser,
     collaboration::{MemberStatus, SharedSpace},
-    contacts::{self, AddressBook},
+    contacts::AddressBook,
     sharing::{Transfer, TransferStatus},
     sharing_ui,
 };
 use chk::{
-    Action, AvatarContent, AvatarIconStyle, Bumper, Context, Display, Flow, Form, FormAction,
-    FormComplete, FormItem, FormValidState, Icons, ListItem, Offset, Page, PageType, State, Theme,
-    Watch,
+    Action, ActionItem, Bumper, Context, Display, Flow, Form, FormComplete, FormValues, Icons,
+    Item, ListItem, ListWatch, Offset, Page, PageType, Root, Theme,
+    design_system::{Footer, Header},
+    profiles::Profile,
 };
 use prism::air::{Id, Instance, Name};
 use std::collections::BTreeMap;
@@ -211,24 +211,9 @@ fn roster(
     index.finish()
 }
 
-fn short_name(name: Name) -> String {
-    let name = name.to_string();
-    format!("{}…{}", &name[..10], &name[name.len() - 8..])
-}
-
-fn item_count(count: usize) -> String {
-    if count == 0 {
-        return "No shared files yet".into();
-    }
-    format!(
-        "{count} shared {}",
-        if count == 1 { "item" } else { "items" }
-    )
-}
-
-/// Snapshot the roster when opening Orange's CHK search form. Watching updates
-/// here would rebuild the form and discard its selected contacts.
-pub(crate) fn search_items(ctx: &Context) -> Vec<(ListItem, Name)> {
+/// Import saved AirNames and accepted sharing history into CHK's private profile
+/// store. Existing aliases, notes and avatars always win; no channel is shared.
+pub(crate) fn sync_profiles(ctx: &mut Context) {
     let books = ctx
         .air
         .instances::<AddressBook>()
@@ -247,135 +232,223 @@ pub(crate) fn search_items(ctx: &Context) -> Vec<(ListItem, Name)> {
         .list()
         .into_values()
         .collect::<Vec<_>>();
-    roster(ctx.air.me(), &books, &spaces, &transfers)
-        .into_iter()
-        .map(|contact| {
-            (
-                ListItem::avatar(
-                    AvatarContent::icon(Icons::Profile, AvatarIconStyle::Brand),
-                    &short_name(contact.name),
-                    &contact.name.to_string(),
-                    None,
-                    None,
-                ),
-                contact.name,
-            )
-        })
-        .collect()
+    for contact in roster(ctx.air.me(), &books, &spaces, &transfers) {
+        Profile::from_name(ctx, contact.name);
+    }
 }
 
-/// Match Orange's nested New contact form: save, return to the existing search
-/// page, and select the new name without losing contacts already selected.
-pub(crate) fn new_contact(theme: &Theme) -> Form {
-    Form::flow(
-        theme,
-        vec![FormItem::text(
-            "New contact",
-            "Fig Files receiving name",
-            Some(vec![
-                FormAction::Paste,
-                FormAction::scan_qr_code("Scan a Fig Files receiving name"),
-            ]),
-            |ctx: &mut Context, text: String| {
-                if text.is_empty() {
-                    FormValidState::Invalid
-                } else {
-                    match contacts::parse(&text, ctx.air.me()) {
-                        Ok(_) => FormValidState::Valid,
-                        Err(error) => FormValidState::InvalidWithData(error.to_string()),
-                    }
-                }
-            },
-        )],
-        None,
-        None,
-        Box::new(|ctx: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(text)) = states.first() else {
-                return FormComplete::None;
-            };
-            let Ok(name) = contacts::parse(text, ctx.air.me()) else {
-                return FormComplete::None;
-            };
-            match contacts::add(&ctx.air, name) {
-                Ok(name) => {
-                    FormComplete::Return(Box::new(move |ctx: &mut Context, theme: &Theme| {
-                        (Action::choose_search(name).get())(ctx, theme)
-                    }))
-                }
-                Err(error) => FormComplete::Next(browser::message(
-                    "Could not add contact",
-                    &error.to_string(),
-                )),
-            }
-        }),
-    )
-}
-
+/// Keep CHK's Contacts home, rows, ordering and empty-state benefits. The only
+/// app-specific substitutions are destinations for file sharing and lookup.
 pub(crate) fn home() -> Page {
+    let mut standard = Root::contacts(&crate::invitations::contacts())
+        .0
+        .builder()
+        .unwrap();
     Page::watching(
         (
-            Watch::list::<AddressBook>(),
-            Watch::list::<SharedSpace>(),
-            Watch::list::<Transfer>(),
+            ListWatch::<AddressBook>::default(),
+            ListWatch::<SharedSpace>::default(),
+            ListWatch::<Transfer>::default(),
+            ListWatch::<Profile>::default(),
         ),
-        |ctx: &mut Context,
-         _: &Theme,
-         (books, spaces, transfers): (
-            Vec<Instance<AddressBook>>,
-            Vec<Instance<SharedSpace>>,
-            Vec<Instance<Transfer>>,
-        )| {
-            let rows = roster(ctx.air.me(), &books, &spaces, &transfers)
-                .into_iter()
-                .map(|contact| {
-                    ListItem::avatar(
-                        AvatarContent::icon(Icons::Profile, AvatarIconStyle::Brand),
-                        &short_name(contact.name),
-                        &item_count(contact.history.len()),
-                        None,
-                        Some(Flow::new(vec![detail(contact.name)])),
-                    )
-                })
-                .collect();
-            PageType::root(
-                "Contacts",
-                vec![],
-                vec![Display::list(
-                    None,
-                    rows,
-                    Some(
-                        "Add someone by their Fig Files receiving name. People you share with also appear here.",
-                    ),
-                )],
-                None,
-                Some((
-                    "Add contact".into(),
-                    Box::new(|_: &mut Context, theme: &Theme| add_flow(theme)),
-                )),
-                None,
-            )
+        move |ctx: &mut Context, theme: &Theme, _| {
+            sync_profiles(ctx);
+            let mut page = standard.build(ctx, theme);
+            if let PageType::Content {
+                items,
+                header,
+                bumper,
+                ..
+            } = &mut page
+            {
+                for item in items {
+                    if let Item::Display(Display::List { items: rows, .. }) = item {
+                        for row in rows {
+                            if let Some(Action::Flow { flow }) = &mut row.action {
+                                flow.0 = flow.0.iter().cloned().map(profile_page).collect();
+                            }
+                        }
+                    }
+                }
+                if let Header::Home { action, .. } = header {
+                    *action = Some((Icons::Search, Action::deferred_flow(search_flow).get()));
+                }
+                if let Bumper::Footer(Footer::Home {
+                    first: Some((_, action)),
+                    ..
+                }) = bumper
+                {
+                    *action =
+                        Action::deferred_flow(|_: &mut Context, theme: &Theme| add_flow(theme))
+                            .get();
+                }
+            }
+            page
         },
     )
+}
+
+/// The shared CHK editor remains responsible for avatar, username and biography.
+/// Adapt its profile view only where a file manager needs a different action.
+fn profile_page(standard: Page) -> Page {
+    Page::watching(
+        (
+            ListWatch::<Profile>::default(),
+            ListWatch::<SharedSpace>::default(),
+            ListWatch::<Transfer>::default(),
+        ),
+        move |ctx: &mut Context,
+              theme: &Theme,
+              (_, spaces, transfers): (Vec<Instance<Profile>>, _, _)| {
+            let mut page = match &standard {
+                Page::Static(page) => *page.clone(),
+                Page::Refreshing(builder) => builder.clone().build(ctx, theme),
+            };
+            adapt_profile(&mut page, ctx, &spaces, &transfers);
+            page
+        },
+    )
+}
+
+fn adapt_profile(
+    page: &mut PageType,
+    ctx: &Context,
+    spaces: &[Instance<SharedSpace>],
+    transfers: &[Instance<Transfer>],
+) {
+    adapt_airname_qr(page);
+    let PageType::Content { items, .. } = page else {
+        return;
+    };
+    // The stock profile descriptor exposes its full identity in the AirName
+    // item, independently of the user-editable username and biography.
+    let Some(name) = items.iter().find_map(|item| match item {
+        Item::Display(Display::Cta {
+            label,
+            instructions,
+            ..
+        }) if label == "AirName" => instructions.parse::<Name>().ok(),
+        _ => None,
+    }) else {
+        return;
+    };
+    for item in items.iter_mut() {
+        if matches!(item, Item::Display(Display::Actions { .. })) {
+            *item = Item::Display(Display::cta(
+                "Files",
+                None,
+                "",
+                vec![ActionItem::new(
+                    Action::flow(Flow::new(vec![sharing_ui::send_picker_for(name)])),
+                    "Share files",
+                    Icons::Send,
+                )],
+            ));
+        }
+    }
+    let history = roster(ctx.air.me(), &[], spaces, transfers)
+        .into_iter()
+        .find(|contact| contact.name == name)
+        .map(|contact| contact.history)
+        .unwrap_or_default();
+    let rows = history
+        .into_iter()
+        .map(|history| {
+            let page = match history.source {
+                HistorySource::Shared => spaces
+                    .iter()
+                    .find(|space| space.id() == history.id)
+                    .map(|space| sharing_ui::invitation_detail(space.clone())),
+                HistorySource::Legacy => transfers
+                    .iter()
+                    .find(|transfer| transfer.id() == history.id)
+                    .map(|transfer| sharing_ui::detail(transfer.clone())),
+            };
+            ListItem::plain(
+                &history.title,
+                &history.description,
+                None,
+                page.map(|page| Action::flow(Flow::new(vec![page]))),
+                false,
+                None,
+            )
+        })
+        .collect();
+    items.push(Item::Display(Display::list(
+        Some("Sharing history"),
+        rows,
+        Some("No shared files yet."),
+    )));
+}
+
+/// Preserve CHK's own-profile editor and its actions, substituting only the QR
+/// destination so cameras can open the same invitation link as the Share action.
+pub(crate) fn profile_root(ctx: &mut Context) -> Root {
+    let mut root = Root::profile(ctx, &crate::invitations::contacts());
+    if let Page::Static(page) = &mut root.0 {
+        adapt_airname_qr(page);
+    }
+    root
+}
+
+fn adapt_airname_qr(page: &mut PageType) {
+    let replace = |display: &mut Display| {
+        let Display::Cta {
+            label,
+            instructions,
+            actions,
+            ..
+        } = display
+        else {
+            return;
+        };
+        if label != "AirName" {
+            return;
+        }
+        let Ok(name) = instructions.parse::<Name>() else {
+            return;
+        };
+        for action in actions {
+            if action.presentation().icon == Icons::QrCode {
+                *action = ActionItem::new(
+                    Action::flow(Flow::new(vec![sharing_ui::receive_name(name)])),
+                    "Display QR Code",
+                    Icons::QrCode,
+                );
+            }
+        }
+    };
+    match page {
+        PageType::Edit { display, .. } => display.iter_mut().for_each(replace),
+        PageType::Content { items, .. } => {
+            for item in items {
+                if let Item::Display(display) = item {
+                    replace(display);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn detail(name: Name) -> Page {
     Page::watching(
         (
-            Watch::list::<AddressBook>(),
-            Watch::list::<SharedSpace>(),
-            Watch::list::<Transfer>(),
+            ListWatch::<Profile>::default(),
+            ListWatch::<AddressBook>::default(),
+            ListWatch::<SharedSpace>::default(),
+            ListWatch::<Transfer>::default(),
         ),
         move |ctx: &mut Context,
               _: &Theme,
-              (books, spaces, transfers): (
+              (_, _, spaces, transfers): (
+            Vec<Instance<Profile>>,
             Vec<Instance<AddressBook>>,
-            Vec<Instance<SharedSpace>>,
-            Vec<Instance<Transfer>>,
+            _,
+            _,
         )| {
-            let Some(contact) = roster(ctx.air.me(), &books, &spaces, &transfers)
-                .into_iter()
-                .find(|contact| contact.name == name)
-            else {
+            sync_profiles(ctx);
+            let Some(profile) = Profile::try_from_name(ctx, name) else {
                 return PageType::display(
                     "Contact unavailable",
                     vec![Display::instructions(
@@ -386,81 +459,59 @@ pub(crate) fn detail(name: Name) -> Page {
                     Offset::Start,
                 );
             };
-            let rows = contact
-                .history
-                .iter()
-                .map(|history| {
-                    let flow = match history.source {
-                        HistorySource::Shared => spaces
-                            .iter()
-                            .find(|space| space.id() == history.id)
-                            .map(|space| {
-                                Flow::new(vec![sharing_ui::invitation_detail(space.clone())])
-                            }),
-                        HistorySource::Legacy => transfers
-                            .iter()
-                            .find(|transfer| transfer.id() == history.id)
-                            .map(|transfer| Flow::new(vec![sharing_ui::detail(transfer.clone())])),
-                    };
-                    ListItem::plain(&history.title, &history.description, None, flow)
-                })
-                .collect();
-            let full = name.to_string();
-            PageType::display(
-                "Contact",
-                vec![
-                    Display::icon(Icons::Profile),
-                    Display::label("Fig Files receiving name"),
-                    Display::text(&full),
-                    Display::instructions(&item_count(contact.history.len())),
-                    Display::list(
-                        Some("Sharing history"),
-                        rows,
-                        Some("Share a file or folder with this contact."),
-                    ),
-                ],
-                None,
-                Bumper::double(
-                    "Share files",
-                    Action::flow(Flow::new(vec![sharing_ui::send_picker_for(name)])),
-                    "Copy name",
-                    Action::copy(&full),
-                ),
-                Offset::Start,
-            )
+            if name == ctx.air.me() {
+                let mut page = Profile::editing(true, profile, ctx.window.is_mobile, None);
+                adapt_airname_qr(&mut page);
+                return page;
+            }
+            let mut page = Profile::profile_view(&crate::invitations::contacts(), ctx, profile);
+            adapt_profile(&mut page, ctx, &spaces, &transfers);
+            page
         },
     )
 }
 
-pub(crate) fn add_flow(theme: &Theme) -> Flow {
-    Flow::from_form(Form::flow(
-        theme,
-        vec![FormItem::text(
-            "Add contact",
-            "Fig Files receiving name",
-            Some(vec![
-                FormAction::Paste,
-                FormAction::scan_qr_code("Scan a Fig Files receiving name"),
-            ]),
-            |ctx: &mut Context, text: String| match contacts::parse(&text, ctx.air.me()) {
-                Ok(_) => FormValidState::Valid,
-                Err(error) => FormValidState::InvalidWithData(error.to_string()),
-            },
-        )],
-        None,
-        None,
-        Box::new(|ctx: &mut Context, states: &Vec<State>| {
-            let Some(State::Text(text)) = states.first() else {
-                return FormComplete::None;
-            };
-            match contacts::parse(text, ctx.air.me()).and_then(|name| contacts::add(&ctx.air, name))
-            {
-                Ok(name) => FormComplete::Next(detail(name)),
-                Err(error) => FormComplete::Next(browser::message(
-                    "Could not add contact",
-                    &error.to_string(),
-                )),
+pub(crate) fn add_flow(_: &Theme) -> Flow {
+    let mut form = Form::new_contact(&crate::invitations::contacts());
+    if let Form::Flow { on_submit, .. } = &mut form {
+        let mut standard = on_submit.clone();
+        *on_submit =
+            Box::new(
+                move |ctx: &mut Context, values: &FormValues| match standard(ctx, values) {
+                    FormComplete::Next(page) => FormComplete::Next(profile_page(page)),
+                    completion => completion,
+                },
+            );
+    }
+    Flow::from_form(form)
+}
+
+/// Reuse CHK's contact rows and live-search layout, keeping file actions on profiles.
+fn search_flow(ctx: &mut Context, _: &Theme) -> Flow {
+    sync_profiles(ctx);
+    Flow::new(vec![crate::search::page(
+        "Contacts",
+        ListWatch::<Profile>::default(),
+        |ctx, _, profiles, query| {
+            let query = query.to_lowercase();
+            let terms = query.split_whitespace().collect::<Vec<_>>();
+            let mut rows =
+                chk::SearchSource::contact_items(&crate::invitations::contacts(), ctx, profiles);
+            rows.retain(|row| {
+                let text = format!("{} {}", row.title, row.subtitle).to_lowercase();
+                terms.iter().all(|term| text.contains(term))
+            });
+            for row in &mut rows {
+                if let Some(Action::Flow { flow }) = &mut row.action {
+                    flow.0 = flow.0.iter().cloned().map(profile_page).collect();
+                }
             }
-        }),
-    ))
+            let empty = if terms.is_empty() {
+                "No contacts yet."
+            } else {
+                "No matching contacts."
+            };
+            vec![Display::list(None, rows, Some(empty))]
+        },
+    )])
 }
